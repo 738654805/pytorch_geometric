@@ -1,19 +1,26 @@
+from typing import Optional
+
 import torch
 
+from torch_geometric.data import Data
+from torch_geometric.data.datapipes import functional_transform
+from torch_geometric.transforms import BaseTransform
 
-class ToDense(object):
+
+@functional_transform('to_dense')
+class ToDense(BaseTransform):
     r"""Converts a sparse adjacency matrix to a dense adjacency matrix with
-    shape :obj:`[num_nodes, num_nodes, *]`.
+    shape :obj:`[num_nodes, num_nodes, *]` (functional name: :obj:`to_dense`).
 
     Args:
-        num_nodes (int): The number of nodes. If set to :obj:`None`, the number
-            of nodes will get automatically inferred. (default: :obj:`None`)
+        num_nodes (int, optional): The number of nodes. If set to :obj:`None`,
+            the number of nodes will get automatically inferred.
+            (default: :obj:`None`)
     """
-
-    def __init__(self, num_nodes=None):
+    def __init__(self, num_nodes: Optional[int] = None):
         self.num_nodes = num_nodes
 
-    def __call__(self, data):
+    def __call__(self, data: Data) -> Data:
         assert data.edge_index is not None
 
         orig_num_nodes = data.num_nodes
@@ -34,7 +41,7 @@ class ToDense(object):
         data.edge_index = None
         data.edge_attr = None
 
-        data.mask = torch.zeros(num_nodes, dtype=torch.uint8)
+        data.mask = torch.zeros(num_nodes, dtype=torch.bool)
         data.mask[:orig_num_nodes] = 1
 
         if data.x is not None:
@@ -51,9 +58,7 @@ class ToDense(object):
 
         return data
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self.num_nodes is None:
-            return '{}()'.format(self.__class__.__name__)
-        else:
-            return '{}(num_nodes={})'.format(self.__class__.__name__,
-                                             self.num_nodes)
+            return super().__repr__()
+        return f'{self.__class__.__name__}(num_nodes={self.num_nodes})'

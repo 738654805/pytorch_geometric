@@ -1,12 +1,18 @@
 import os
 import os.path as osp
+from typing import Callable, List, Optional
 
-import torch
 import numpy as np
 import scipy.sparse as sp
+import torch
 from torch_sparse import coalesce
-from torch_geometric.data import (InMemoryDataset, Data, download_url,
-                                  extract_zip)
+
+from torch_geometric.data import (
+    Data,
+    InMemoryDataset,
+    download_url,
+    extract_zip,
+)
 
 
 class Reddit(InMemoryDataset):
@@ -24,29 +30,39 @@ class Reddit(InMemoryDataset):
             an :obj:`torch_geometric.data.Data` object and returns a
             transformed version. The data object will be transformed before
             being saved to disk. (default: :obj:`None`)
-        pre_filter (callable, optional): A function that takes in an
-            :obj:`torch_geometric.data.Data` object and returns a boolean
-            value, indicating whether the data object should be included in the
-            final dataset. (default: :obj:`None`)
+
+    Stats:
+        .. list-table::
+            :widths: 10 10 10 10
+            :header-rows: 1
+
+            * - #nodes
+              - #edges
+              - #features
+              - #classes
+            * - 232,965
+              - 114,615,892
+              - 602
+              - 41
     """
 
-    url = 'https://s3.us-east-2.amazonaws.com/dgl.ai/dataset/reddit.zip'
+    url = 'https://data.dgl.ai/dataset/reddit.zip'
 
-    def __init__(self,
-                 root,
-                 transform=None,
-                 pre_transform=None,
-                 pre_filter=None):
-        super(Reddit, self).__init__(root, transform, pre_transform,
-                                     pre_filter)
+    def __init__(
+        self,
+        root: str,
+        transform: Optional[Callable] = None,
+        pre_transform: Optional[Callable] = None,
+    ):
+        super().__init__(root, transform, pre_transform)
         self.data, self.slices = torch.load(self.processed_paths[0])
 
     @property
-    def raw_file_names(self):
+    def raw_file_names(self) -> List[str]:
         return ['reddit_data.npz', 'reddit_graph.npz']
 
     @property
-    def processed_file_names(self):
+    def processed_file_names(self) -> str:
         return 'data.pt'
 
     def download(self):
@@ -71,7 +87,6 @@ class Reddit(InMemoryDataset):
         data.val_mask = split == 2
         data.test_mask = split == 3
 
-        torch.save(self.collate([data]), self.processed_paths[0])
+        data = data if self.pre_transform is None else self.pre_transform(data)
 
-    def __repr__(self):
-        return '{}()'.format(self.name)
+        torch.save(self.collate([data]), self.processed_paths[0])

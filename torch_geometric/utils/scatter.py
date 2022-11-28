@@ -1,35 +1,96 @@
+import warnings
+from typing import Optional
+
+import torch
 import torch_scatter
+from torch import Tensor
+from torch_scatter import scatter_max, scatter_min, scatter_mul
 
+major, minor, _ = torch.__version__.split('.', maxsplit=2)
+major, minor = int(major), int(minor)
+has_pytorch112 = major > 1 or (major == 1 and minor >= 12)
 
-def scatter_(name, src, index, dim_size=None):
-    r"""Aggregates all values from the :attr:`src` tensor at the indices
-    specified in the :attr:`index` tensor along the first dimension.
-    If multiple indices reference the same location, their contributions
-    are aggregated according to :attr:`name` (either :obj:`"add"`,
-    :obj:`"mean"` or :obj:`"max"`).
+if has_pytorch112:  # pragma: no cover
 
-    Args:
-        name (string): The aggregation to use (:obj:`"add"`, :obj:`"mean"`,
-            :obj:`"max"`).
-        src (Tensor): The source tensor.
-        index (LongTensor): The indices of elements to scatter.
-        dim_size (int, optional): Automatically create output tensor with size
-            :attr:`dim_size` in the first dimension. If set to :attr:`None`, a
-            minimal sized output tensor is returned. (default: :obj:`None`)
+    warnings.filterwarnings('ignore', '.*is in beta and the API may change.*')
 
-    :rtype: :class:`Tensor`
-    """
+    def broadcast(src: Tensor, ref: Tensor, dim: int) -> Tensor:
+        size = [1] * ref.dim()
+        size[dim] = -1
+        return src.view(size).expand_as(ref)
 
-    assert name in ['add', 'mean', 'max']
+    def scatter(src: Tensor, index: Tensor, dim: int = 0,
+                dim_size: Optional[int] = None, reduce: str = 'sum') -> Tensor:
 
-    op = getattr(torch_scatter, 'scatter_{}'.format(name))
-    fill_value = -1e9 if name == 'max' else 0
+        if index.dim() != 1:
+            raise ValueError(f"The `index` argument must be one-dimensional "
+                             f"(got {index.dim()} dimensions)")
 
-    out = op(src, index, 0, None, dim_size, fill_value)
-    if isinstance(out, tuple):
-        out = out[0]
+        dim = src.dim() + dim if dim < 0 else dim
 
-    if name == 'max':
-        out[out == fill_value] = 0
+        if dim < 0 or dim >= src.dim():
+            raise ValueError(f"The `dim` argument must lay between 0 and "
+                             f"{src.dim() - 1} (got {dim})")
 
-    return out
+        if dim_size is None:
+            dim_size = int(index.max()) + 1 if index.numel() > 0 else 0
+
+        # For now, we maintain various different code paths, based on whether
+        # the input requires gradients and whether it lays on the CPU/GPU.
+        # For example, `torch_scatter` is usually faster than
+        # `torch.scatter_reduce` on GPU, while `torch.scatter_reduce` is faster
+        # on CPU.
+        # `torch.scatter_reduce` has a faster forward implementation for
+        # "min"/"max" reductions since it does not compute additional arg
+        # indices, but is therefore way slower in its backward implementation.
+        # More insights can be found in `test/utils/test_scatter.py`.
+
+        size = list(src.size())
+        size[dim] = dim_size
+
+        # For "sum" and "mean" reduction, we make use of `scatter_add_`:
+        if reduce == 'sum' or reduce == 'add':
+            index = broadcast(index, src, dim)
+            return src.new_zeros(size).scatter_add_(dim, index, src)
+
+        if reduce == 'mean':
+            count = src.new_zeros(dim_size)
+            count.scatter_add_(0, index, src.new_ones(src.size(dim)))
+            count = count.clamp_(min=1)
+
+            index = broadcast(index, src, dim)
+            out = src.new_zeros(size).scatter_add_(dim, index, src)
+
+            return out / broadcast(count, out, dim)
+
+        # For "min" and "max" reduction, we prefer `scatter_reduce_` on CPU or
+        # in case the input does not require gradients:
+        if reduce == 'min' or reduce == 'max':
+            if not src.is_cuda or not src.requires_grad:
+                index = broadcast(index, src, dim)
+                return src.new_zeros(size).scatter_reduce_(
+                    dim, index, src, reduce=f'a{reduce}', include_self=False)
+
+            if reduce == 'min':
+                return scatter_min(src, index, dim, dim_size=dim_size)[0]
+            else:
+                return scatter_max(src, index, dim, dim_size=dim_size)[0]
+
+        # For "mul" reduction, we prefer `scatter_reduce_` on CPU:
+        if reduce == 'mul':
+            if not src.is_cuda:
+                index = broadcast(index, src, dim)
+                # We initialize with `one` here to match `scatter_mul` output:
+                return src.new_ones(size).scatter_reduce_(
+                    dim, index, src, reduce='prod', include_self=True)
+            else:
+                return scatter_mul(src, index, dim, dim_size=dim_size)
+
+        raise ValueError(f"Encountered invalid `reduce` argument '{reduce}'")
+
+else:
+
+    def scatter(src: Tensor, index: Tensor, dim: int = 0,
+                dim_size: Optional[int] = None, reduce: str = 'sum') -> Tensor:
+        return torch_scatter.scatter(src, index, dim, dim_size=dim_size,
+                                     reduce=reduce)

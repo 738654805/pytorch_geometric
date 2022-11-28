@@ -1,4 +1,8 @@
+from typing import Optional
+
 import torch
+from torch import Tensor
+from torch.nn import Module
 
 from ..inits import reset
 
@@ -8,9 +12,13 @@ class DenseGINConv(torch.nn.Module):
 
     :rtype: :class:`Tensor`
     """
-
-    def __init__(self, nn, eps=0, train_eps=False):
-        super(DenseGINConv, self).__init__()
+    def __init__(
+        self,
+        nn: Module,
+        eps: float = 0.0,
+        train_eps: bool = False,
+    ):
+        super().__init__()
 
         self.nn = nn
         self.initial_eps = eps
@@ -24,7 +32,8 @@ class DenseGINConv(torch.nn.Module):
         reset(self.nn)
         self.eps.data.fill_(self.initial_eps)
 
-    def forward(self, x, adj, mask=None, add_loop=True):
+    def forward(self, x: Tensor, adj: Tensor, mask: Optional[Tensor] = None,
+                add_loop: bool = True) -> Tensor:
         r"""
         Args:
             x (Tensor): Node feature tensor :math:`\mathbf{X} \in \mathbb{R}^{B
@@ -35,7 +44,7 @@ class DenseGINConv(torch.nn.Module):
                 \times N \times N}`. The adjacency tensor is broadcastable in
                 the batch dimension, resulting in a shared adjacency matrix for
                 the complete batch.
-            mask (ByteTensor, optional): Mask matrix
+            mask (BoolTensor, optional): Mask matrix
                 :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
                 the valid nodes for each graph. (default: :obj:`None`)
             add_loop (bool, optional): If set to :obj:`False`, the layer will
@@ -57,5 +66,5 @@ class DenseGINConv(torch.nn.Module):
 
         return out
 
-    def __repr__(self):
-        return '{}(nn={})'.format(self.__class__.__name__, self.nn)
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(nn={self.nn})'

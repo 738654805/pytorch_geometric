@@ -1,9 +1,16 @@
+from typing import Optional
+
 import torch
 
+from torch_geometric.data import Data
+from torch_geometric.data.datapipes import functional_transform
+from torch_geometric.transforms import BaseTransform
 
-class Cartesian(object):
+
+@functional_transform('cartesian')
+class Cartesian(BaseTransform):
     r"""Saves the relative Cartesian coordinates of linked nodes in its edge
-    attributes.
+    attributes (functional name: :obj:`cartesian`).
 
     Args:
         norm (bool, optional): If set to :obj:`False`, the output will not be
@@ -15,19 +22,23 @@ class Cartesian(object):
         cat (bool, optional): If set to :obj:`False`, all existing edge
             attributes will be replaced. (default: :obj:`True`)
     """
-
-    def __init__(self, norm=True, max_value=None, cat=True):
+    def __init__(
+        self,
+        norm: bool = True,
+        max_value: Optional[float] = None,
+        cat: bool = True,
+    ):
         self.norm = norm
         self.max = max_value
         self.cat = cat
 
-    def __call__(self, data):
+    def __call__(self, data: Data) -> Data:
         (row, col), pos, pseudo = data.edge_index, data.pos, data.edge_attr
 
-        cart = pos[col] - pos[row]
+        cart = pos[row] - pos[col]
         cart = cart.view(-1, 1) if cart.dim() == 1 else cart
 
-        if self.norm:
+        if self.norm and cart.numel() > 0:
             max_value = cart.abs().max() if self.max is None else self.max
             cart = cart / (2 * max_value) + 0.5
 
@@ -39,6 +50,6 @@ class Cartesian(object):
 
         return data
 
-    def __repr__(self):
-        return '{}(norm={}, max_value={})'.format(self.__class__.__name__,
-                                                  self.norm, self.max)
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}(norm={self.norm}, '
+                f'max_value={self.max})')

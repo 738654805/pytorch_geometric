@@ -2,28 +2,23 @@ import time
 
 import torch
 import torch.nn.functional as F
+from sklearn.model_selection import StratifiedKFold
 from torch import tensor
 from torch.optim import Adam
-from sklearn.model_selection import StratifiedKFold
-from torch_geometric.data import DataLoader, DenseDataLoader as DenseLoader
+
+from torch_geometric.loader import DataLoader
+from torch_geometric.loader import DenseDataLoader as DenseLoader
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def cross_validation_with_val_set(dataset,
-                                  model,
-                                  folds,
-                                  epochs,
-                                  batch_size,
-                                  lr,
-                                  lr_decay_factor,
-                                  lr_decay_step_size,
-                                  weight_decay,
-                                  logger=None):
+def cross_validation_with_val_set(dataset, model, folds, epochs, batch_size,
+                                  lr, lr_decay_factor, lr_decay_step_size,
+                                  weight_decay, logger=None):
 
     val_losses, accs, durations = [], [], []
-    for fold, (train_idx, test_idx, val_idx) in enumerate(
-            zip(*k_fold(dataset, folds))):
+    for fold, (train_idx, test_idx,
+               val_idx) in enumerate(zip(*k_fold(dataset, folds))):
 
         train_dataset = dataset[train_idx]
         test_dataset = dataset[test_idx]
@@ -80,8 +75,8 @@ def cross_validation_with_val_set(dataset,
     acc_mean = acc.mean().item()
     acc_std = acc.std().item()
     duration_mean = duration.mean().item()
-    print('Val Loss: {:.4f}, Test Accuracy: {:.3f} ± {:.3f}, Duration: {:.3f}'.
-          format(loss_mean, acc_mean, acc_std, duration_mean))
+    print(f'Val Loss: {loss_mean:.4f}, Test Accuracy: {acc_mean:.3f} '
+          f'± {acc_std:.3f}, Duration: {duration_mean:.3f}')
 
     return loss_mean, acc_mean, acc_std
 
@@ -91,21 +86,21 @@ def k_fold(dataset, folds):
 
     test_indices, train_indices = [], []
     for _, idx in skf.split(torch.zeros(len(dataset)), dataset.data.y):
-        test_indices.append(torch.from_numpy(idx))
+        test_indices.append(torch.from_numpy(idx).to(torch.long))
 
     val_indices = [test_indices[i - 1] for i in range(folds)]
 
     for i in range(folds):
-        train_mask = torch.ones(len(dataset), dtype=torch.uint8)
+        train_mask = torch.ones(len(dataset), dtype=torch.bool)
         train_mask[test_indices[i]] = 0
         train_mask[val_indices[i]] = 0
-        train_indices.append(train_mask.nonzero().view(-1))
+        train_indices.append(train_mask.nonzero(as_tuple=False).view(-1))
 
     return train_indices, test_indices, val_indices
 
 
 def num_graphs(data):
-    if data.batch is not None:
+    if hasattr(data, 'num_graphs'):
         return data.num_graphs
     else:
         return data.x.size(0)
@@ -148,3 +143,13 @@ def eval_loss(model, loader):
             out = model(data)
         loss += F.nll_loss(out, data.y.view(-1), reduction='sum').item()
     return loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def inference_run(model, loader, bf16):
+    model.eval()
+    for data in loader:
+        data = data.to(device)
+        if bf16:
+            data.x = data.x.to(torch.bfloat16)
+        model(data)

@@ -1,120 +1,188 @@
+import inspect
+from collections.abc import Sequence
+from typing import Any, List, Optional, Union
+
+import numpy as np
 import torch
-import torch_geometric
-from torch_geometric.data import Data
+from torch import Tensor
+
+from torch_geometric.data.collate import collate
+from torch_geometric.data.data import BaseData, Data
+from torch_geometric.data.dataset import IndexType
+from torch_geometric.data.separate import separate
 
 
-class Batch(Data):
-    r"""A plain old python object modeling a batch of graphs as one big
-    (dicconnected) graph. With :class:`torch_geometric.data.Data` being the
-    base class, all its methods can also be used here.
-    In addition, single graphs can be reconstructed via the assignment vector
+class DynamicInheritance(type):
+    # A meta class that sets the base class of a `Batch` object, e.g.:
+    # * `Batch(Data)` in case `Data` objects are batched together
+    # * `Batch(HeteroData)` in case `HeteroData` objects are batched together
+    def __call__(cls, *args, **kwargs):
+        base_cls = kwargs.pop('_base_cls', Data)
+
+        if issubclass(base_cls, Batch):
+            new_cls = base_cls
+        else:
+            name = f'{base_cls.__name__}{cls.__name__}'
+
+            # NOTE `MetaResolver` is necessary to resolve metaclass conflict
+            # problems between `DynamicInheritance` and the metaclass of
+            # `base_cls`. In particular, it creates a new common metaclass
+            # from the defined metaclasses.
+            class MetaResolver(type(cls), type(base_cls)):
+                pass
+
+            if name not in globals():
+                globals()[name] = MetaResolver(name, (cls, base_cls), {})
+            new_cls = globals()[name]
+
+        params = list(inspect.signature(base_cls.__init__).parameters.items())
+        for i, (k, v) in enumerate(params[1:]):
+            if k == 'args' or k == 'kwargs':
+                continue
+            if i < len(args) or k in kwargs:
+                continue
+            if v.default is not inspect.Parameter.empty:
+                continue
+            kwargs[k] = None
+
+        return super(DynamicInheritance, new_cls).__call__(*args, **kwargs)
+
+
+class DynamicInheritanceGetter(object):
+    def __call__(self, cls, base_cls):
+        return cls(_base_cls=base_cls)
+
+
+class Batch(metaclass=DynamicInheritance):
+    r"""A data object describing a batch of graphs as one big (disconnected)
+    graph.
+    Inherits from :class:`torch_geometric.data.Data` or
+    :class:`torch_geometric.data.HeteroData`.
+    In addition, single graphs can be identified via the assignment vector
     :obj:`batch`, which maps each node to its respective graph identifier.
     """
-
-    def __init__(self, batch=None, **kwargs):
-        super(Batch, self).__init__(**kwargs)
-
-        self.batch = batch
-        self.__data_class__ = Data
-        self.__slices__ = None
-
-    @staticmethod
-    def from_data_list(data_list, follow_batch=[]):
-        r"""Constructs a batch object from a python list holding
-        :class:`torch_geometric.data.Data` objects.
+    @classmethod
+    def from_data_list(cls, data_list: List[BaseData],
+                       follow_batch: Optional[List[str]] = None,
+                       exclude_keys: Optional[List[str]] = None):
+        r"""Constructs a :class:`~torch_geometric.data.Batch` object from a
+        Python list of :class:`~torch_geometric.data.Data` or
+        :class:`~torch_geometric.data.HeteroData` objects.
         The assignment vector :obj:`batch` is created on the fly.
-        Additionally, creates assignment batch vectors for each key in
-        :obj:`follow_batch`."""
+        In addition, creates assignment vectors for each key in
+        :obj:`follow_batch`.
+        Will exclude any keys given in :obj:`exclude_keys`."""
 
-        keys = [set(data.keys) for data in data_list]
-        keys = list(set.union(*keys))
-        assert 'batch' not in keys
+        batch, slice_dict, inc_dict = collate(
+            cls,
+            data_list=data_list,
+            increment=True,
+            add_batch=not isinstance(data_list[0], Batch),
+            follow_batch=follow_batch,
+            exclude_keys=exclude_keys,
+        )
 
-        batch = Batch()
-        batch.__data_class__ = data_list[0].__class__
-        batch.__slices__ = {key: [0] for key in keys}
+        batch._num_graphs = len(data_list)
+        batch._slice_dict = slice_dict
+        batch._inc_dict = inc_dict
 
-        for key in keys:
-            batch[key] = []
+        return batch
 
-        for key in follow_batch:
-            batch['{}_batch'.format(key)] = []
+    def get_example(self, idx: int) -> BaseData:
+        r"""Gets the :class:`~torch_geometric.data.Data` or
+        :class:`~torch_geometric.data.HeteroData` object at index :obj:`idx`.
+        The :class:`~torch_geometric.data.Batch` object must have been created
+        via :meth:`from_data_list` in order to be able to reconstruct the
+        initial object."""
 
-        cumsum = {key: 0 for key in keys}
-        batch.batch = []
-        for i, data in enumerate(data_list):
-            for key in data.keys:
-                item = data[key] + cumsum[key]
-                if torch.is_tensor(data[key]):
-                    size = data[key].size(data.__cat_dim__(key, data[key]))
-                else:
-                    size = 1
-                batch.__slices__[key].append(size + batch.__slices__[key][-1])
-                cumsum[key] += data.__inc__(key, item)
-                batch[key].append(item)
-
-                if key in follow_batch:
-                    item = torch.full((size, ), i, dtype=torch.long)
-                    batch['{}_batch'.format(key)].append(item)
-
-            num_nodes = data.num_nodes
-            if num_nodes is not None:
-                item = torch.full((num_nodes, ), i, dtype=torch.long)
-                batch.batch.append(item)
-
-        if num_nodes is None:
-            batch.batch = None
-
-        for key in batch.keys:
-            item = batch[key][0]
-            if torch.is_tensor(item):
-                batch[key] = torch.cat(batch[key],
-                                       dim=data_list[0].__cat_dim__(key, item))
-            elif isinstance(item, int) or isinstance(item, float):
-                batch[key] = torch.tensor(batch[key])
-            else:
-                raise ValueError('Unsupported attribute type')
-
-        # Copy custom data functions to batch (does not work yet):
-        # if data_list.__class__ != Data:
-        #     org_funcs = set(Data.__dict__.keys())
-        #     funcs = set(data_list[0].__class__.__dict__.keys())
-        #     batch.__custom_funcs__ = funcs.difference(org_funcs)
-        #     for func in funcs.difference(org_funcs):
-        #         setattr(batch, func, getattr(data_list[0], func))
-
-        if torch_geometric.is_debug_enabled():
-            batch.debug()
-
-        return batch.contiguous()
-
-    def to_data_list(self):
-        r"""Reconstructs the list of :class:`torch_geometric.data.Data` objects
-        from the batch object.
-        The batch object must have been created via :meth:`from_data_list` in
-        order to be able reconstruct the initial objects."""
-
-        if self.__slices__ is None:
+        if not hasattr(self, '_slice_dict'):
             raise RuntimeError(
-                ('Cannot reconstruct data list from batch because the batch '
-                 'object was not created using Batch.from_data_list()'))
+                ("Cannot reconstruct 'Data' object from 'Batch' because "
+                 "'Batch' was not created via 'Batch.from_data_list()'"))
 
-        keys = [key for key in self.keys if key[-5:] != 'batch']
-        cumsum = {key: 0 for key in keys}
-        data_list = []
-        for i in range(len(self.__slices__[keys[0]]) - 1):
-            data = self.__data_class__()
-            for key in keys:
-                data[key] = self[key].narrow(
-                    data.__cat_dim__(key, self[key]), self.__slices__[key][i],
-                    self.__slices__[key][i + 1] - self.__slices__[key][i])
-                data[key] = data[key] - cumsum[key]
-                cumsum[key] += data.__inc__(key, data[key])
-            data_list.append(data)
+        data = separate(
+            cls=self.__class__.__bases__[-1],
+            batch=self,
+            idx=idx,
+            slice_dict=self._slice_dict,
+            inc_dict=self._inc_dict,
+            decrement=True,
+        )
 
-        return data_list
+        return data
+
+    def index_select(self, idx: IndexType) -> List[BaseData]:
+        r"""Creates a subset of :class:`~torch_geometric.data.Data` or
+        :class:`~torch_geometric.data.HeteroData` objects from specified
+        indices :obj:`idx`.
+        Indices :obj:`idx` can be a slicing object, *e.g.*, :obj:`[2:5]`, a
+        list, a tuple, or a :obj:`torch.Tensor` or :obj:`np.ndarray` of type
+        long or bool.
+        The :class:`~torch_geometric.data.Batch` object must have been created
+        via :meth:`from_data_list` in order to be able to reconstruct the
+        initial objects."""
+        if isinstance(idx, slice):
+            idx = list(range(self.num_graphs)[idx])
+
+        elif isinstance(idx, Tensor) and idx.dtype == torch.long:
+            idx = idx.flatten().tolist()
+
+        elif isinstance(idx, Tensor) and idx.dtype == torch.bool:
+            idx = idx.flatten().nonzero(as_tuple=False).flatten().tolist()
+
+        elif isinstance(idx, np.ndarray) and idx.dtype == np.int64:
+            idx = idx.flatten().tolist()
+
+        elif isinstance(idx, np.ndarray) and idx.dtype == bool:
+            idx = idx.flatten().nonzero()[0].flatten().tolist()
+
+        elif isinstance(idx, Sequence) and not isinstance(idx, str):
+            pass
+
+        else:
+            raise IndexError(
+                f"Only slices (':'), list, tuples, torch.tensor and "
+                f"np.ndarray of dtype long or bool are valid indices (got "
+                f"'{type(idx).__name__}')")
+
+        return [self.get_example(i) for i in idx]
+
+    def __getitem__(self, idx: Union[int, np.integer, str, IndexType]) -> Any:
+        if (isinstance(idx, (int, np.integer))
+                or (isinstance(idx, Tensor) and idx.dim() == 0)
+                or (isinstance(idx, np.ndarray) and np.isscalar(idx))):
+            return self.get_example(idx)
+        elif isinstance(idx, str) or (isinstance(idx, tuple)
+                                      and isinstance(idx[0], str)):
+            # Accessing attributes or node/edge types:
+            return super().__getitem__(idx)
+        else:
+            return self.index_select(idx)
+
+    def to_data_list(self) -> List[BaseData]:
+        r"""Reconstructs the list of :class:`~torch_geometric.data.Data` or
+        :class:`~torch_geometric.data.HeteroData` objects from the
+        :class:`~torch_geometric.data.Batch` object.
+        The :class:`~torch_geometric.data.Batch` object must have been created
+        via :meth:`from_data_list` in order to be able to reconstruct the
+        initial objects."""
+        return [self.get_example(i) for i in range(self.num_graphs)]
 
     @property
-    def num_graphs(self):
+    def num_graphs(self) -> int:
         """Returns the number of graphs in the batch."""
-        return self.batch[-1].item() + 1
+        if hasattr(self, '_num_graphs'):
+            return self._num_graphs
+        elif hasattr(self, 'ptr'):
+            return self.ptr.numel() - 1
+        elif hasattr(self, 'batch'):
+            return int(self.batch.max()) + 1
+        else:
+            raise ValueError("Can not infer the number of graphs")
+
+    def __len__(self) -> int:
+        return self.num_graphs
+
+    def __reduce__(self):
+        state = self.__dict__.copy()
+        return DynamicInheritanceGetter(), self.__class__.__bases__, state

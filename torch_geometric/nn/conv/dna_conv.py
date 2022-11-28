@@ -1,19 +1,22 @@
-from __future__ import division
-
 import math
+from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Parameter
-import torch.nn.functional as F
-from torch_geometric.nn.conv import MessagePassing, GCNConv
+from torch_sparse import SparseTensor
 
-from ..inits import uniform, kaiming_uniform
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.nn.conv.gcn_conv import gcn_norm
+from torch_geometric.typing import Adj, OptTensor
+
+from ..inits import kaiming_uniform, uniform
 
 
 class Linear(torch.nn.Module):
     def __init__(self, in_channels, out_channels, groups=1, bias=True):
-        super(Linear, self).__init__()
+        super().__init__()
         assert in_channels % groups == 0 and out_channels % groups == 0
 
         self.in_channels = in_channels
@@ -21,7 +24,8 @@ class Linear(torch.nn.Module):
         self.groups = groups
 
         self.weight = Parameter(
-            Tensor(groups, in_channels // groups, out_channels // groups))
+            torch.Tensor(groups, in_channels // groups,
+                         out_channels // groups))
 
         if bias:
             self.bias = Parameter(torch.Tensor(out_channels))
@@ -39,28 +43,27 @@ class Linear(torch.nn.Module):
         # Output: [*, out_channels]
 
         if self.groups > 1:
-            size = list(src.size())[:-1]
+            size = src.size()[:-1]
             src = src.view(-1, self.groups, self.in_channels // self.groups)
             src = src.transpose(0, 1).contiguous()
             out = torch.matmul(src, self.weight)
             out = out.transpose(1, 0).contiguous()
-            out = out.view(*(size + [self.out_channels]))
+            out = out.view(size + (self.out_channels, ))
         else:
             out = torch.matmul(src, self.weight.squeeze(0))
 
         if self.bias is not None:
-            out += self.bias
+            out = out + self.bias
 
         return out
 
-    def __repr__(self):  # pragma: no cover
-        return '{}({}, {}, groups={}, bias={})'.format(
-            self.__class__.__name__, self.in_channels, self.out_channels,
-            self.groups, self.bias is not None)
+    def __repr__(self) -> str:  # pragma: no cover
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'{self.out_channels}, groups={self.groups})')
 
 
-def restricted_softmax(src, dim=-1, margin=0):
-    src_max = torch.clamp(src.max(dim=dim, keepdim=True)[0], min=0)
+def restricted_softmax(src, dim: int = -1, margin: float = 0.):
+    src_max = torch.clamp(src.max(dim=dim, keepdim=True)[0], min=0.)
     out = (src - src_max).exp()
     out = out / (out.sum(dim=dim, keepdim=True) + (margin - src_max).exp())
     return out
@@ -68,10 +71,13 @@ def restricted_softmax(src, dim=-1, margin=0):
 
 class Attention(torch.nn.Module):
     def __init__(self, dropout=0):
-        super(Attention, self).__init__()
+        super().__init__()
         self.dropout = dropout
 
     def forward(self, query, key, value):
+        return self.compute_attention(query, key, value)
+
+    def compute_attention(self, query, key, value):
         # query: [*, query_entries, dim_k]
         # key: [*, key_entries, dim_k]
         # value: [*, key_entries, dim_v]
@@ -89,19 +95,14 @@ class Attention(torch.nn.Module):
 
         return torch.matmul(score, value)
 
-    def __repr__(self):  # pragma: no cover
-        return '{}(dropout={})'.format(self.__class__.__name__, self.dropout)
+    def __repr__(self) -> str:  # pragma: no cover
+        return f'{self.__class__.__name__}(dropout={self.dropout})'
 
 
 class MultiHead(Attention):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 heads=1,
-                 groups=1,
-                 dropout=0,
+    def __init__(self, in_channels, out_channels, heads=1, groups=1, dropout=0,
                  bias=True):
-        super(MultiHead, self).__init__(dropout)
+        super().__init__(dropout)
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -141,31 +142,32 @@ class MultiHead(Attention):
         # query: [*, heads, query_entries, out_channels // heads]
         # key: [*, heads, key_entries, out_channels // heads]
         # value: [*, heads, key_entries, out_channels // heads]
-        size = list(query.size())[:-2]
+        size = query.size()[:-2]
         out_channels_per_head = self.out_channels // self.heads
 
-        query_size = size + [query.size(-2), self.heads, out_channels_per_head]
-        query = query.view(*query_size).transpose(-2, -3)
+        query_size = size + (query.size(-2), self.heads, out_channels_per_head)
+        query = query.view(query_size).transpose(-2, -3)
 
-        key_size = size + [key.size(-2), self.heads, out_channels_per_head]
-        key = key.view(*key_size).transpose(-2, -3)
+        key_size = size + (key.size(-2), self.heads, out_channels_per_head)
+        key = key.view(key_size).transpose(-2, -3)
 
-        value_size = size + [value.size(-2), self.heads, out_channels_per_head]
-        value = value.view(*value_size).transpose(-2, -3)
+        value_size = size + (value.size(-2), self.heads, out_channels_per_head)
+        value = value.view(value_size).transpose(-2, -3)
 
         # Output: [*, heads, query_entries, out_channels // heads]
-        out = super(MultiHead, self).forward(query, key, value)
+        out = self.compute_attention(query, key, value)
         # Output: [*, query_entries, heads, out_channels // heads]
         out = out.transpose(-3, -2).contiguous()
         # Output: [*, query_entries, out_channels]
-        out = out.view(*(size + [query.size(-2), self.out_channels]))
+        out = out.view(size + (query.size(-2), self.out_channels))
 
         return out
 
-    def __repr__(self):  # pragma: no cover
-        return '{}({}, {}, heads={}, groups={}, dropout={}, bias={})'.format(
-            self.__class__.__name__, self.in_channels, self.out_channels,
-            self.heads, self.groups, self.dropout, self.bias)
+    def __repr__(self) -> str:  # pragma: no cover
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'{self.out_channels}, heads={self.heads}, '
+                f'groups={self.groups}, dropout={self.droput}, '
+                f'bias={self.bias})')
 
 
 class DNAConv(MessagePassing):
@@ -204,67 +206,102 @@ class DNAConv(MessagePassing):
         groups (int, optional): Number of groups to use for all linear
             projections. (default: :obj:`1`)
         dropout (float, optional): Dropout probability of attention
-            coefficients. (default: :obj:`0`)
+            coefficients. (default: :obj:`0.`)
         cached (bool, optional): If set to :obj:`True`, the layer will cache
-            the computation of :math:`{\left(\mathbf{\hat{D}}^{-1/2}
-            \mathbf{\hat{A}} \mathbf{\hat{D}}^{-1/2} \right)}`.
-            (default: :obj:`False`)
+            the computation of :math:`\mathbf{\hat{D}}^{-1/2} \mathbf{\hat{A}}
+            \mathbf{\hat{D}}^{-1/2}` on first execution, and will use the
+            cached version for further executions.
+            This parameter should only be set to :obj:`True` in transductive
+            learning scenarios. (default: :obj:`False`)
+        normalize (bool, optional): Whether to add self-loops and apply
+            symmetric normalization. (default: :obj:`True`)
+        add_self_loops (bool, optional): If set to :obj:`False`, will not add
+            self-loops to the input graph. (default: :obj:`True`)
         bias (bool, optional): If set to :obj:`False`, the layer will not learn
             an additive bias. (default: :obj:`True`)
         **kwargs (optional): Additional arguments of
             :class:`torch_geometric.nn.conv.MessagePassing`.
+
+    Shapes:
+        - **input:**
+          node features :math:`(|\mathcal{V}|, L, F)` where :math:`L` is the
+          number of layers,
+          edge indices :math:`(2, |\mathcal{E}|)`
+        - **output:** node features :math:`(|\mathcal{V}|, F)`
     """
 
-    def __init__(self,
-                 channels,
-                 heads=1,
-                 groups=1,
-                 dropout=0,
-                 cached=False,
-                 bias=True,
-                 **kwargs):
-        super(DNAConv, self).__init__(aggr='add', **kwargs)
+    _cached_edge_index: Optional[Tuple[Tensor, Tensor]]
+    _cached_adj_t: Optional[SparseTensor]
+
+    def __init__(self, channels: int, heads: int = 1, groups: int = 1,
+                 dropout: float = 0., cached: bool = False,
+                 normalize: bool = True, add_self_loops: bool = True,
+                 bias: bool = True, **kwargs):
+        kwargs.setdefault('aggr', 'add')
+        super().__init__(node_dim=0, **kwargs)
+
         self.bias = bias
         self.cached = cached
-        self.cached_result = None
+        self.normalize = normalize
+        self.add_self_loops = add_self_loops
+
+        self._cached_edge_index = None
+        self._cached_adj_t = None
+
         self.multi_head = MultiHead(channels, channels, heads, groups, dropout,
                                     bias)
         self.reset_parameters()
 
     def reset_parameters(self):
         self.multi_head.reset_parameters()
-        self.cached_result = None
+        self._cached_edge_index = None
+        self._cached_adj_t = None
 
-    def forward(self, x, edge_index, edge_weight=None):
-        """"""
-        # x: [num_nodes, num_layers, channels]
-        # edge_index: [2, num_edges]
-        # edge_weight: [num_edges]
+    def forward(self, x: Tensor, edge_index: Adj,
+                edge_weight: OptTensor = None) -> Tensor:
+        r"""
+        Args:
+            x: The input node features of shape :obj:`[num_nodes, num_layers,
+                channels]`.
+        """
 
         if x.dim() != 3:
             raise ValueError('Feature shape must be [num_nodes, num_layers, '
                              'channels].')
-        num_nodes, num_layers, channels = x.size()
 
-        if not self.cached or self.cached_result is None:
-            edge_index, norm = GCNConv.norm(
-                edge_index, x.size(0), edge_weight, dtype=x.dtype)
-            self.cached_result = edge_index, norm
-        edge_index, norm = self.cached_result
+        if self.normalize:
+            if isinstance(edge_index, Tensor):
+                cache = self._cached_edge_index
+                if cache is None:
+                    edge_index, edge_weight = gcn_norm(  # yapf: disable
+                        edge_index, edge_weight, x.size(self.node_dim), False,
+                        self.add_self_loops, self.flow, dtype=x.dtype)
+                    if self.cached:
+                        self._cached_edge_index = (edge_index, edge_weight)
+                else:
+                    edge_index, edge_weight = cache[0], cache[1]
 
-        return self.propagate(edge_index, x=x, norm=norm)
+            elif isinstance(edge_index, SparseTensor):
+                cache = self._cached_adj_t
+                if cache is None:
+                    edge_index = gcn_norm(  # yapf: disable
+                        edge_index, edge_weight, x.size(self.node_dim), False,
+                        self.add_self_loops, self.flow, dtype=x.dtype)
+                    if self.cached:
+                        self._cached_adj_t = edge_index
+                else:
+                    edge_index = cache
 
-    def message(self, x_i, x_j, norm):
-        # x_i: [num_edges, num_layers, channels]
-        # x_j: [num_edges, num_layers, channels]
-        # norm: [num_edges]
-        # Output: [num_edges, channels]
+        # propagate_type: (x: Tensor, edge_weight: OptTensor)
+        return self.propagate(edge_index, x=x, edge_weight=edge_weight,
+                              size=None)
 
+    def message(self, x_i: Tensor, x_j: Tensor, edge_weight: Tensor) -> Tensor:
         x_i = x_i[:, -1:]  # [num_edges, 1, channels]
         out = self.multi_head(x_i, x_j, x_j)  # [num_edges, 1, channels]
-        return norm.view(-1, 1) * out.squeeze(1)
+        return edge_weight.view(-1, 1) * out.squeeze(1)
 
-    def __repr__(self):
-        return '{}({}, heads={}, groups={})'.format(
-            self.__class__.__name__, self.multi_head.in_channels,
-            self.multi_head.heads, self.multi_head.groups)
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}({self.multi_head.in_channels}, '
+                f'heads={self.multi_head.heads}, '
+                f'groups={self.multi_head.groups})')

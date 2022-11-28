@@ -1,18 +1,19 @@
-import sys
-import random
 import os.path as osp
+import random
 import shutil
+import sys
 
 import torch
-from torch_geometric.nn import RENet
+
 from torch_geometric.datasets.icews import EventDataset
-from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import RENet
+from torch_geometric.testing import is_full_test
 
 
 class MyTestEventDataset(EventDataset):
     def __init__(self, root, seq_len):
-        super(MyTestEventDataset, self).__init__(
-            root, pre_transform=RENet.pre_transform(seq_len))
+        super().__init__(root, pre_transform=RENet.pre_transform(seq_len))
         self.data, self.slices = torch.load(self.processed_paths[0])
 
     @property
@@ -38,7 +39,7 @@ class MyTestEventDataset(EventDataset):
         return torch.stack([sub, rel, obj, t], dim=1)
 
     def process(self):
-        data_list = super(MyTestEventDataset, self).process()
+        data_list = super().process()
         torch.save(self.collate(data_list), self.processed_paths[0])
 
 
@@ -47,8 +48,11 @@ def test_re_net():
     dataset = MyTestEventDataset(root, seq_len=4)
     loader = DataLoader(dataset, 2, follow_batch=['h_sub', 'h_obj'])
 
-    model = RENet(
-        dataset.num_nodes, dataset.num_rels, hidden_channels=16, seq_len=4)
+    model = RENet(dataset.num_nodes, dataset.num_rels, hidden_channels=16,
+                  seq_len=4)
+
+    if is_full_test():
+        jit = torch.jit.export(model)
 
     logits = torch.randn(6, 6)
     y = torch.tensor([0, 1, 2, 3, 4, 5])
@@ -59,6 +63,10 @@ def test_re_net():
 
     for data in loader:
         log_prob_obj, log_prob_sub = model(data)
+        if is_full_test():
+            log_prob_obj_jit, log_prob_sub_jit = jit(data)
+            assert torch.allclose(log_prob_obj_jit, log_prob_obj)
+            assert torch.allclose(log_prob_sub_jit, log_prob_sub)
         model.test(log_prob_obj, data.obj)
         model.test(log_prob_sub, data.sub)
 

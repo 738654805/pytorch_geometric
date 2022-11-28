@@ -1,30 +1,16 @@
-import numpy as np
+from typing import Optional, Tuple
+
 import scipy.sparse
-from sklearn.decomposition import TruncatedSVD
-from sklearn.metrics import roc_auc_score, f1_score
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 from torch_sparse import coalesce
+
 from torch_geometric.nn import SignedConv
-
-from .autoencoder import negative_sampling
-
-
-def negative_triangle_sampling(edge_index, num_nodes):
-    device = edge_index
-    i, j = edge_index.to(torch.device('cpu'))
-    idx_1 = i * num_nodes + j
-    k = torch.randint(num_nodes, (i.size(0), ), dtype=torch.long)
-    idx_2 = k * num_nodes + i
-    mask = torch.from_numpy(np.isin(idx_2, idx_1).astype(np.uint8))
-    rest = mask.nonzero().view(-1)
-    while rest.numel() > 0:  # pragma: no cover
-        tmp = torch.randint(num_nodes, (rest.numel(), ), dtype=torch.long)
-        idx_2 = tmp * num_nodes + i[rest]
-        mask = torch.from_numpy(np.isin(idx_2, idx_1).astype(np.uint8))
-        k[rest] = tmp
-        rest = mask.nonzero().view(-1)
-    return i.to(device), j.to(device), k.to(device)
+from torch_geometric.utils import (
+    negative_sampling,
+    structured_negative_sampling,
+)
 
 
 class SignedGCN(torch.nn.Module):
@@ -35,34 +21,35 @@ class SignedGCN(torch.nn.Module):
 
     Args:
         in_channels (int): Size of each input sample.
-        out_channels (int): Size of each output sample.
+        hidden_channels (int): Size of each hidden sample.
         num_layers (int): Number of layers.
         lamb (float, optional): Balances the contributions of the overall
             objective. (default: :obj:`5`)
         bias (bool, optional): If set to :obj:`False`, all layers will not
             learn an additive bias. (default: :obj:`True`)
     """
-
-    def __init__(self,
-                 in_channels,
-                 hidden_channels,
-                 num_layers,
-                 lamb=5,
-                 bias=True):
-        super(SignedGCN, self).__init__()
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        num_layers: int,
+        lamb: float = 5,
+        bias: bool = True,
+    ):
+        super().__init__()
 
         self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
         self.lamb = lamb
 
-        self.conv1 = SignedConv(
-            in_channels, hidden_channels // 2, first_aggr=True)
+        self.conv1 = SignedConv(in_channels, hidden_channels // 2,
+                                first_aggr=True)
         self.convs = torch.nn.ModuleList()
         for i in range(num_layers - 1):
             self.convs.append(
-                SignedConv(
-                    hidden_channels // 2,
-                    hidden_channels // 2,
-                    first_aggr=False))
+                SignedConv(hidden_channels // 2, hidden_channels // 2,
+                           first_aggr=False))
 
         self.lin = torch.nn.Linear(2 * hidden_channels, 3)
 
@@ -74,7 +61,11 @@ class SignedGCN(torch.nn.Module):
             conv.reset_parameters()
         self.lin.reset_parameters()
 
-    def split_edges(self, edge_index, test_ratio=0.2):
+    def split_edges(
+        self,
+        edge_index: Tensor,
+        test_ratio: float = 0.2,
+    ) -> Tuple[Tensor, Tensor]:
         r"""Splits the edges :obj:`edge_index` into train and test edges.
 
         Args:
@@ -82,18 +73,20 @@ class SignedGCN(torch.nn.Module):
             test_ratio (float, optional): The ratio of test edges.
                 (default: :obj:`0.2`)
         """
-        mask = torch.ones(edge_index.size(1), dtype=torch.uint8)
+        mask = torch.ones(edge_index.size(1), dtype=torch.bool)
         mask[torch.randperm(mask.size(0))[:int(test_ratio * mask.size(0))]] = 0
 
         train_edge_index = edge_index[:, mask]
-        test_edge_index = edge_index[:, 1 - mask]
+        test_edge_index = edge_index[:, ~mask]
 
         return train_edge_index, test_edge_index
 
-    def create_spectral_features(self,
-                                 pos_edge_index,
-                                 neg_edge_index,
-                                 num_nodes=None):
+    def create_spectral_features(
+        self,
+        pos_edge_index: Tensor,
+        neg_edge_index: Tensor,
+        num_nodes: Optional[int] = None,
+    ) -> Tensor:
         r"""Creates :obj:`in_channels` spectral node features based on
         positive and negative edges.
 
@@ -104,6 +97,7 @@ class SignedGCN(torch.nn.Module):
                 :obj:`max_val + 1` of :attr:`pos_edge_index` and
                 :attr:`neg_edge_index`. (default: :obj:`None`)
         """
+        from sklearn.decomposition import TruncatedSVD
 
         edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
         N = edge_index.max().item() + 1 if num_nodes is None else num_nodes
@@ -130,7 +124,12 @@ class SignedGCN(torch.nn.Module):
         x = svd.components_.T
         return torch.from_numpy(x).to(torch.float).to(pos_edge_index.device)
 
-    def forward(self, x, pos_edge_index, neg_edge_index):
+    def forward(
+        self,
+        x: Tensor,
+        pos_edge_index: Tensor,
+        neg_edge_index: Tensor,
+    ) -> Tensor:
         """Computes node embeddings :obj:`z` based on positive edges
         :obj:`pos_edge_index` and negative edges :obj:`neg_edge_index`.
 
@@ -144,7 +143,7 @@ class SignedGCN(torch.nn.Module):
             z = F.relu(conv(z, pos_edge_index, neg_edge_index))
         return z
 
-    def discriminate(self, z, edge_index):
+    def discriminate(self, z: Tensor, edge_index: Tensor) -> Tensor:
         """Given node embeddings :obj:`z`, classifies the link relation
         between node pairs :obj:`edge_index` to be either positive,
         negative or non-existent.
@@ -157,7 +156,12 @@ class SignedGCN(torch.nn.Module):
         value = self.lin(value)
         return torch.log_softmax(value, dim=1)
 
-    def nll_loss(self, z, pos_edge_index, neg_edge_index):
+    def nll_loss(
+        self,
+        z: Tensor,
+        pos_edge_index: Tensor,
+        neg_edge_index: Tensor,
+    ) -> Tensor:
         """Computes the discriminator loss based on node embeddings :obj:`z`,
         and positive edges :obj:`pos_edge_index` and negative nedges
         :obj:`neg_edge_index`.
@@ -183,7 +187,11 @@ class SignedGCN(torch.nn.Module):
             none_edge_index.new_full((none_edge_index.size(1), ), 2))
         return nll_loss / 3.0
 
-    def pos_embedding_loss(self, z, pos_edge_index):
+    def pos_embedding_loss(
+        self,
+        z: Tensor,
+        pos_edge_index: Tensor,
+    ) -> Tensor:
         """Computes the triplet loss between positive node pairs and sampled
         non-node pairs.
 
@@ -191,12 +199,12 @@ class SignedGCN(torch.nn.Module):
             z (Tensor): The node embeddings.
             pos_edge_index (LongTensor): The positive edge indices.
         """
-        i, j, k = negative_triangle_sampling(pos_edge_index, z.size(0))
+        i, j, k = structured_negative_sampling(pos_edge_index, z.size(0))
 
         out = (z[i] - z[j]).pow(2).sum(dim=1) - (z[i] - z[k]).pow(2).sum(dim=1)
         return torch.clamp(out, min=0).mean()
 
-    def neg_embedding_loss(self, z, neg_edge_index):
+    def neg_embedding_loss(self, z: Tensor, neg_edge_index: Tensor) -> Tensor:
         """Computes the triplet loss between negative node pairs and sampled
         non-node pairs.
 
@@ -204,12 +212,17 @@ class SignedGCN(torch.nn.Module):
             z (Tensor): The node embeddings.
             neg_edge_index (LongTensor): The negative edge indices.
         """
-        i, j, k = negative_triangle_sampling(neg_edge_index, z.size(0))
+        i, j, k = structured_negative_sampling(neg_edge_index, z.size(0))
 
         out = (z[i] - z[k]).pow(2).sum(dim=1) - (z[i] - z[j]).pow(2).sum(dim=1)
         return torch.clamp(out, min=0).mean()
 
-    def loss(self, z, pos_edge_index, neg_edge_index):
+    def loss(
+        self,
+        z: Tensor,
+        pos_edge_index: Tensor,
+        neg_edge_index: Tensor,
+    ) -> Tensor:
         """Computes the overall objective.
 
         Args:
@@ -222,7 +235,12 @@ class SignedGCN(torch.nn.Module):
         loss_2 = self.neg_embedding_loss(z, neg_edge_index)
         return nll_loss + self.lamb * (loss_1 + loss_2)
 
-    def test(self, z, pos_edge_index, neg_edge_index):
+    def test(
+        self,
+        z: Tensor,
+        pos_edge_index: Tensor,
+        neg_edge_index: Tensor,
+    ) -> Tuple[float, float]:
         """Evaluates node embeddings :obj:`z` on positive and negative test
         edges by computing AUC and F1 scores.
 
@@ -231,6 +249,8 @@ class SignedGCN(torch.nn.Module):
             pos_edge_index (LongTensor): The positive edge indices.
             neg_edge_index (LongTensor): The negative edge indices.
         """
+        from sklearn.metrics import f1_score, roc_auc_score
+
         with torch.no_grad():
             pos_p = self.discriminate(z, pos_edge_index)[:, :2].max(dim=1)[1]
             neg_p = self.discriminate(z, neg_edge_index)[:, :2].max(dim=1)[1]
@@ -244,3 +264,7 @@ class SignedGCN(torch.nn.Module):
         f1 = f1_score(y, pred, average='binary') if pred.sum() > 0 else 0
 
         return auc, f1
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'{self.hidden_channels}, num_layers={self.num_layers})')

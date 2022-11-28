@@ -1,9 +1,13 @@
 import torch
-from torch.nn import Sequential as Seq, Linear as Lin, ReLU
-from torch_geometric.nn import GINConv, DenseGINConv
+from torch.nn import Linear as Lin
+from torch.nn import ReLU
+from torch.nn import Sequential as Seq
+
+from torch_geometric.nn import DenseGINConv, GINConv
+from torch_geometric.testing import is_full_test
 
 
-def test_dense_sage_conv():
+def test_dense_gin_conv():
     channels = 16
     nn = Seq(Lin(channels, channels), ReLU(), Lin(channels, channels))
     sparse_conv = GINConv(nn)
@@ -36,10 +40,14 @@ def test_dense_sage_conv():
             [0, 0, 0],
         ],
     ])
-    mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.uint8)
+    mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool)
 
     dense_out = dense_conv(x, adj, mask)
     assert dense_out.size() == (2, 3, channels)
+
+    if is_full_test():
+        jit = torch.jit.script(dense_conv)
+        assert torch.allclose(jit(x, adj, mask), dense_out)
 
     assert dense_out[1, 2].abs().sum().item() == 0
     dense_out = dense_out.view(6, channels)[:-1]
@@ -59,5 +67,5 @@ def test_dense_gin_conv_with_broadcasting():
     ])
 
     assert conv(x, adj).size() == (batch_size, num_nodes, channels)
-    mask = torch.tensor([1, 1, 1], dtype=torch.uint8)
+    mask = torch.tensor([1, 1, 1], dtype=torch.bool)
     assert conv(x, adj, mask).size() == (batch_size, num_nodes, channels)

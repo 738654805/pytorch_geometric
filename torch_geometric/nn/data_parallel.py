@@ -1,7 +1,8 @@
-import warnings
+import logging
 from itertools import chain
 
 import torch
+
 from torch_geometric.data import Batch
 
 
@@ -23,7 +24,7 @@ class DataParallel(torch.nn.DataParallel):
 
     .. note::
 
-        You need to use the :class:`torch_geometric.data.DataListLoader` for
+        You need to use the :class:`torch_geometric.loader.DataListLoader` for
         this module.
 
     Args:
@@ -32,29 +33,37 @@ class DataParallel(torch.nn.DataParallel):
             (default: all devices)
         output_device (int or torch.device): Device location of output.
             (default: :obj:`device_ids[0]`)
+        follow_batch (list or tuple, optional): Creates assignment batch
+            vectors for each key in the list. (default: :obj:`[]`)
+        exclude_keys (list or tuple, optional): Will exclude each key in the
+            list. (default: :obj:`[]`)
     """
-
-    def __init__(self, module, device_ids=None, output_device=None):
-        super(DataParallel, self).__init__(module, device_ids, output_device)
-        self.src_device = torch.device("cuda:{}".format(self.device_ids[0]))
+    def __init__(self, module, device_ids=None, output_device=None,
+                 follow_batch=[], exclude_keys=[]):
+        super().__init__(module, device_ids, output_device)
+        self.src_device = torch.device(f'cuda:{self.device_ids[0]}')
+        self.follow_batch = follow_batch
+        self.exclude_keys = exclude_keys
 
     def forward(self, data_list):
         """"""
         if len(data_list) == 0:
-            warnings.warn('DataParallel received an empty data list, which '
-                          'may result in unexpected behaviour.')
+            logging.warning('DataParallel received an empty data list, which '
+                            'may result in unexpected behaviour.')
             return None
 
         if not self.device_ids or len(self.device_ids) == 1:  # Fallback
-            data = Batch.from_data_list(data_list).to(self.src_device)
+            data = Batch.from_data_list(
+                data_list, follow_batch=self.follow_batch,
+                exclude_keys=self.exclude_keys).to(self.src_device)
             return self.module(data)
 
         for t in chain(self.module.parameters(), self.module.buffers()):
             if t.device != self.src_device:
                 raise RuntimeError(
-                    ('Module must have its parameters and buffers on device '
-                     '{} but found one of them on device {}.').format(
-                         self.src_device, t.device))
+                    f"Module must have its parameters and buffers on device "
+                    f"'{self.src_device}' but found one of them on device "
+                    f"'{t.device}'")
 
         inputs = self.scatter(data_list, self.device_ids)
         replicas = self.replicate(self.module, self.device_ids[:len(inputs)])
@@ -76,7 +85,9 @@ class DataParallel(torch.nn.DataParallel):
         split = split.tolist()
 
         return [
-            Batch.from_data_list(data_list[split[i]:split[i + 1]]).to(
-                torch.device('cuda:{}'.format(device_ids[i])))
+            Batch.from_data_list(data_list[split[i]:split[i + 1]],
+                                 follow_batch=self.follow_batch,
+                                 exclude_keys=self.exclude_keys).to(
+                                     torch.device(f'cuda:{device_ids[i]}'))
             for i in range(len(split) - 1)
         ]

@@ -1,3 +1,0 @@
-torch-scatter
-torch-sparse
-torch-cluster==1.4.3-alpha1

@@ -1,56 +1,41 @@
 import datetime
-import sphinx_rtd_theme
-import doctest
+
 import torch_geometric
+
+author = 'PyG Team'
+project = 'pytorch_geometric'
+version = torch_geometric.__version__
+copyright = f'{datetime.datetime.now().year}, {author}'
 
 extensions = [
     'sphinx.ext.autodoc',
-    'sphinx.ext.doctest',
+    'sphinx.ext.autosummary',
     'sphinx.ext.intersphinx',
     'sphinx.ext.mathjax',
     'sphinx.ext.napoleon',
     'sphinx.ext.viewcode',
-    'sphinx.ext.githubpages',
 ]
 
-source_suffix = '.rst'
-master_doc = 'index'
-
-author = 'Matthias Fey'
-project = 'pytorch_geometric'
-copyright = '{}, {}'.format(datetime.datetime.now().year, author)
-
-version = torch_geometric.__version__
-release = torch_geometric.__version__
-
-html_theme = 'sphinx_rtd_theme'
-html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
-
-doctest_default_flags = doctest.NORMALIZE_WHITESPACE
-intersphinx_mapping = {'python': ('https://docs.python.org/', None)}
-
-html_theme_options = {
-    'collapse_navigation': False,
-    'display_version': True,
-    'logo_only': True,
-}
-
-html_logo = '_static/img/pyg_logo_text.svg'
-html_static_path = ['_static']
-html_context = {'css_files': ['_static/css/custom.css']}
+html_theme = 'pyg_sphinx_theme'
+html_logo = ('https://raw.githubusercontent.com/pyg-team/pyg_sphinx_theme/'
+             'master/pyg_sphinx_theme/static/img/pyg_logo.png')
+html_favicon = ('https://raw.githubusercontent.com/pyg-team/pyg_sphinx_theme/'
+                'master/pyg_sphinx_theme/static/img/favicon.png')
 
 add_module_names = False
+autodoc_member_order = 'bysource'
+
+intersphinx_mapping = {
+    'python': ('https://docs.python.org/', None),
+    'numpy': ('http://docs.scipy.org/doc/numpy', None),
+    'pandas': ('http://pandas.pydata.org/pandas-docs/dev', None),
+    'torch': ('https://pytorch.org/docs/master', None),
+}
 
 
 def setup(app):
-    def skip(app, what, name, obj, skip, options):
-        members = [
-            '__init__',
-            '__repr__',
-            '__weakref__',
-            '__dict__',
-            '__module__',
-        ]
-        return True if name in members else skip
+    def rst_jinja_render(app, _, source):
+        rst_context = {'torch_geometric': torch_geometric}
+        source[0] = app.builder.templates.render_string(source[0], rst_context)
 
-    app.connect('autodoc-skip-member', skip)
+    app.connect('source-read', rst_jinja_render)

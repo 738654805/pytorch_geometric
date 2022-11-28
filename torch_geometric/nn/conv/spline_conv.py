@@ -1,18 +1,22 @@
 import warnings
+from typing import List, Tuple, Union
 
 import torch
-import torch_geometric
+from torch import Tensor, nn
 from torch.nn import Parameter
+
 from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.nn.dense.linear import Linear
+from torch_geometric.typing import Adj, OptPairTensor, OptTensor, Size
 from torch_geometric.utils.repeat import repeat
 
 from ..inits import uniform, zeros
 
 try:
-    from torch_spline_conv import SplineBasis, SplineWeighting
-except ImportError:
-    SplineBasis = None
-    SplineWeighting = None
+    from torch_spline_conv import spline_basis, spline_weighting
+except (ImportError, OSError):  # Fail gracefully on GLIBC errors
+    spline_basis = None
+    spline_weighting = None
 
 
 class SplineConv(MessagePassing):
@@ -34,7 +38,10 @@ class SplineConv(MessagePassing):
         this method to work as intended.
 
     Args:
-        in_channels (int): Size of each input sample.
+        in_channels (int or tuple): Size of each input sample, or :obj:`-1` to
+            derive the size from the first input(s) to the forward method.
+            A tuple corresponds to the sizes of source and target
+            dimensionalities.
         out_channels (int): Size of each output sample.
         dim (int): Pseudo-coordinate dimensionality.
         kernel_size (int or [int]): Size of the convolving kernel.
@@ -53,27 +60,29 @@ class SplineConv(MessagePassing):
         **kwargs (optional): Additional arguments of
             :class:`torch_geometric.nn.conv.MessagePassing`.
     """
+    def __init__(
+        self,
+        in_channels: Union[int, Tuple[int, int]],
+        out_channels: int,
+        dim: int,
+        kernel_size: Union[int, List[int]],
+        is_open_spline: bool = True,
+        degree: int = 1,
+        aggr: str = 'mean',
+        root_weight: bool = True,
+        bias: bool = True,
+        **kwargs,
+    ):
+        super().__init__(aggr=aggr, **kwargs)
 
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 dim,
-                 kernel_size,
-                 is_open_spline=True,
-                 degree=1,
-                 aggr='mean',
-                 root_weight=True,
-                 bias=True,
-                 **kwargs):
-        super(SplineConv, self).__init__(aggr=aggr, **kwargs)
-
-        if SplineBasis is None:
-            raise ImportError('`SplineConv` requires `torch-spline-conv`.')
+        if spline_basis is None:
+            raise ImportError("'SplineConv' requires 'torch-spline-conv'")
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.dim = dim
         self.degree = degree
+        self.root_weight = root_weight
 
         kernel_size = torch.tensor(repeat(kernel_size, dim), dtype=torch.long)
         self.register_buffer('kernel_size', kernel_size)
@@ -82,13 +91,22 @@ class SplineConv(MessagePassing):
         is_open_spline = torch.tensor(is_open_spline, dtype=torch.uint8)
         self.register_buffer('is_open_spline', is_open_spline)
 
-        K = kernel_size.prod().item()
-        self.weight = Parameter(torch.Tensor(K, in_channels, out_channels))
+        if isinstance(in_channels, int):
+            in_channels = (in_channels, in_channels)
+
+        self.K = kernel_size.prod().item()
+
+        if in_channels[0] > 0:
+            self.weight = Parameter(
+                torch.Tensor(self.K, in_channels[0], out_channels))
+        else:
+            self.weight = torch.nn.parameter.UninitializedParameter()
+            self._hook = self.register_forward_pre_hook(
+                self.initialize_parameters)
 
         if root_weight:
-            self.root = Parameter(torch.Tensor(in_channels, out_channels))
-        else:
-            self.register_parameter('root', None)
+            self.lin = Linear(in_channels[1], out_channels, bias=False,
+                              weight_initializer='uniform')
 
         if bias:
             self.bias = Parameter(torch.Tensor(out_channels))
@@ -98,60 +116,52 @@ class SplineConv(MessagePassing):
         self.reset_parameters()
 
     def reset_parameters(self):
-        size = self.in_channels * self.weight.size(0)
-        uniform(size, self.weight)
-        uniform(size, self.root)
+        if not isinstance(self.weight, nn.UninitializedParameter):
+            size = self.weight.size(0) * self.weight.size(1)
+            uniform(size, self.weight)
+        if self.root_weight:
+            self.lin.reset_parameters()
         zeros(self.bias)
 
-    def forward(self, x, edge_index, pseudo):
+    def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj,
+                edge_attr: OptTensor = None, size: Size = None) -> Tensor:
         """"""
-        x = x.unsqueeze(-1) if x.dim() == 1 else x
-        pseudo = pseudo.unsqueeze(-1) if pseudo.dim() == 1 else pseudo
+        if isinstance(x, Tensor):
+            x: OptPairTensor = (x, x)
 
-        if not x.is_cuda:
-            warnings.warn('We do not recommend using the non-optimized CPU '
-                          'version of SplineConv. If possible, please convert '
-                          'your data to the GPU first.')
+        if not x[0].is_cuda:
+            warnings.warn(
+                'We do not recommend using the non-optimized CPU version of '
+                '`SplineConv`. If possible, please move your data to GPU.')
 
-        if torch_geometric.is_debug_enabled():
-            if x.size(1) != self.in_channels:
-                raise RuntimeError(
-                    'Expected {} node features, but found {}'.format(
-                        self.in_channels, x.size(1)))
+        # propagate_type: (x: OptPairTensor, edge_attr: OptTensor)
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=size)
 
-            if pseudo.size(1) != self.dim:
-                raise RuntimeError(
-                    ('Expected pseudo-coordinate dimensionality of {}, but '
-                     'found {}').format(self.dim, pseudo.size(1)))
+        x_r = x[1]
+        if x_r is not None and self.root_weight:
+            out = out + self.lin(x_r)
 
-            min_index, max_index = edge_index.min(), edge_index.max()
-            if min_index < 0 or max_index > x.size(0) - 1:
-                raise RuntimeError(
-                    ('Edge indices must lay in the interval [0, {}]'
-                     ' but found them in the interval [{}, {}]').format(
-                         x.size(0) - 1, min_index, max_index))
-
-            min_pseudo, max_pseudo = pseudo.min(), pseudo.max()
-            if min_pseudo < 0 or max_pseudo > 1:
-                raise RuntimeError(
-                    ('Pseudo-coordinates must lay in the fixed interval [0, 1]'
-                     ' but found them in the interval [{}, {}]').format(
-                         min_pseudo, max_pseudo))
-
-        return self.propagate(edge_index, x=x, pseudo=pseudo)
-
-    def message(self, x_j, pseudo):
-        data = SplineBasis.apply(pseudo, self._buffers['kernel_size'],
-                                 self._buffers['is_open_spline'], self.degree)
-        return SplineWeighting.apply(x_j, self.weight, *data)
-
-    def update(self, aggr_out, x):
-        if self.root is not None:
-            aggr_out = aggr_out + torch.mm(x, self.root)
         if self.bias is not None:
-            aggr_out = aggr_out + self.bias
-        return aggr_out
+            out = out + self.bias
 
-    def __repr__(self):
-        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels,
-                                   self.out_channels)
+        return out
+
+    def message(self, x_j: Tensor, edge_attr: Tensor) -> Tensor:
+        data = spline_basis(edge_attr, self.kernel_size, self.is_open_spline,
+                            self.degree)
+        return spline_weighting(x_j, self.weight, *data)
+
+    @torch.no_grad()
+    def initialize_parameters(self, module, input):
+        if isinstance(self.weight, torch.nn.parameter.UninitializedParameter):
+            x = input[0][0] if isinstance(input, tuple) else input[0]
+            in_channels = x.size(-1)
+            self.weight.materialize((self.K, in_channels, self.out_channels))
+            size = self.weight.size(0) * self.weight.size(1)
+            uniform(size, self.weight)
+        module._hook.remove()
+        delattr(module, '_hook')
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'{self.out_channels}, dim={self.dim})')

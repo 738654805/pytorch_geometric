@@ -1,8 +1,17 @@
+from typing import Callable, Optional, Union
+
 import torch
+from torch import Tensor
+
 from torch_geometric.nn.conv import MessagePassing
-from torch_cluster import knn_graph
+from torch_geometric.typing import Adj, OptTensor, PairOptTensor, PairTensor
 
 from ..inits import reset
+
+try:
+    from torch_cluster import knn
+except ImportError:
+    knn = None
 
 
 class EdgeConv(MessagePassing):
@@ -26,31 +35,39 @@ class EdgeConv(MessagePassing):
             (default: :obj:`"max"`)
         **kwargs (optional): Additional arguments of
             :class:`torch_geometric.nn.conv.MessagePassing`.
-    """
 
-    def __init__(self, nn, aggr='max', **kwargs):
-        super(EdgeConv, self).__init__(aggr='max', **kwargs)
+    Shapes:
+        - **input:**
+          node features :math:`(|\mathcal{V}|, F_{in})` or
+          :math:`((|\mathcal{V}|, F_{in}), (|\mathcal{V}|, F_{in}))`
+          if bipartite,
+          edge indices :math:`(2, |\mathcal{E}|)`
+        - **output:** node features :math:`(|\mathcal{V}|, F_{out})` or
+          :math:`(|\mathcal{V}_t|, F_{out})` if bipartite
+    """
+    def __init__(self, nn: Callable, aggr: str = 'max', **kwargs):
+        super().__init__(aggr=aggr, **kwargs)
         self.nn = nn
         self.reset_parameters()
 
     def reset_parameters(self):
         reset(self.nn)
 
-    def forward(self, x, edge_index):
+    def forward(self, x: Union[Tensor, PairTensor], edge_index: Adj) -> Tensor:
         """"""
-        row, col = edge_index
-        x = x.unsqueeze(-1) if x.dim() == 1 else x
+        if isinstance(x, Tensor):
+            x: PairTensor = (x, x)
+        # propagate_type: (x: PairTensor)
+        return self.propagate(edge_index, x=x, size=None)
 
-        return self.propagate(edge_index, x=x)
+    def message(self, x_i: Tensor, x_j: Tensor) -> Tensor:
+        return self.nn(torch.cat([x_i, x_j - x_i], dim=-1))
 
-    def message(self, x_i, x_j):
-        return self.nn(torch.cat([x_i, x_j - x_i], dim=1))
-
-    def __repr__(self):
-        return '{}(nn={})'.format(self.__class__.__name__, self.nn)
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(nn={self.nn})'
 
 
-class DynamicEdgeConv(EdgeConv):
+class DynamicEdgeConv(MessagePassing):
     r"""The dynamic edge convolutional operator from the `"Dynamic Graph CNN
     for Learning on Point Clouds" <https://arxiv.org/abs/1801.07829>`_ paper
     (see :class:`torch_geometric.nn.conv.EdgeConv`), where the graph is
@@ -64,19 +81,64 @@ class DynamicEdgeConv(EdgeConv):
         k (int): Number of nearest neighbors.
         aggr (string): The aggregation operator to use (:obj:`"add"`,
             :obj:`"mean"`, :obj:`"max"`). (default: :obj:`"max"`)
+        num_workers (int): Number of workers to use for k-NN computation.
+            Has no effect in case :obj:`batch` is not :obj:`None`, or the input
+            lies on the GPU. (default: :obj:`1`)
         **kwargs (optional): Additional arguments of
             :class:`torch_geometric.nn.conv.MessagePassing`.
+
+    Shapes:
+        - **input:**
+          node features :math:`(|\mathcal{V}|, F_{in})` or
+          :math:`((|\mathcal{V}|, F_{in}), (|\mathcal{V}|, F_{in}))`
+          if bipartite,
+          batch vector :math:`(|\mathcal{V}|)` or
+          :math:`((|\mathcal{V}|), (|\mathcal{V}|))`
+          if bipartite *(optional)*
+        - **output:** node features :math:`(|\mathcal{V}|, F_{out})` or
+          :math:`(|\mathcal{V}_t|, F_{out})` if bipartite
     """
+    def __init__(self, nn: Callable, k: int, aggr: str = 'max',
+                 num_workers: int = 1, **kwargs):
+        super().__init__(aggr=aggr, flow='source_to_target', **kwargs)
 
-    def __init__(self, nn, k, aggr='max', **kwargs):
-        super(DynamicEdgeConv, self).__init__(nn=nn, aggr=aggr, **kwargs)
+        if knn is None:
+            raise ImportError('`DynamicEdgeConv` requires `torch-cluster`.')
+
+        self.nn = nn
         self.k = k
+        self.num_workers = num_workers
+        self.reset_parameters()
 
-    def forward(self, x, batch=None):
+    def reset_parameters(self):
+        reset(self.nn)
+
+    def forward(
+            self, x: Union[Tensor, PairTensor],
+            batch: Union[OptTensor, Optional[PairTensor]] = None) -> Tensor:
+        # type: (Tensor, OptTensor) -> Tensor  # noqa
+        # type: (PairTensor, Optional[PairTensor]) -> Tensor  # noqa
         """"""
-        edge_index = knn_graph(x, self.k, batch, loop=False, flow=self.flow)
-        return super(DynamicEdgeConv, self).forward(x, edge_index)
+        if isinstance(x, Tensor):
+            x: PairTensor = (x, x)
 
-    def __repr__(self):
-        return '{}(nn={}, k={})'.format(self.__class__.__name__, self.nn,
-                                        self.k)
+        if x[0].dim() != 2:
+            raise ValueError("Static graphs not supported in DynamicEdgeConv")
+
+        b: PairOptTensor = (None, None)
+        if isinstance(batch, Tensor):
+            b = (batch, batch)
+        elif isinstance(batch, tuple):
+            assert batch is not None
+            b = (batch[0], batch[1])
+
+        edge_index = knn(x[0], x[1], self.k, b[0], b[1]).flip([0])
+
+        # propagate_type: (x: PairTensor)
+        return self.propagate(edge_index, x=x, size=None)
+
+    def message(self, x_i: Tensor, x_j: Tensor) -> Tensor:
+        return self.nn(torch.cat([x_i, x_j - x_i], dim=-1))
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(nn={self.nn}, k={self.k})'

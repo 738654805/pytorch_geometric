@@ -1,9 +1,11 @@
 import os.path as osp
 import shutil
+from typing import Callable, List, Optional
 
 import torch
+
 from torch_geometric.data import InMemoryDataset, extract_zip
-from torch_geometric.read import read_ply
+from torch_geometric.io import read_ply
 
 
 class FAUST(InMemoryDataset):
@@ -39,32 +41,46 @@ class FAUST(InMemoryDataset):
             :obj:`torch_geometric.data.Data` object and returns a boolean
             value, indicating whether the data object should be included in the
             final dataset. (default: :obj:`None`)
+
+    Stats:
+        .. list-table::
+            :widths: 10 10 10 10 10
+            :header-rows: 1
+
+            * - #graphs
+              - #nodes
+              - #edges
+              - #features
+              - #classes
+            * - 100
+              - 6,890
+              - 41,328
+              - 3
+              - 10
     """
 
     url = 'http://faust.is.tue.mpg.de/'
 
-    def __init__(self,
-                 root,
-                 train=True,
-                 transform=None,
-                 pre_transform=None,
-                 pre_filter=None):
-        super(FAUST, self).__init__(root, transform, pre_transform, pre_filter)
+    def __init__(self, root: str, train: bool = True,
+                 transform: Optional[Callable] = None,
+                 pre_transform: Optional[Callable] = None,
+                 pre_filter: Optional[Callable] = None):
+        super().__init__(root, transform, pre_transform, pre_filter)
         path = self.processed_paths[0] if train else self.processed_paths[1]
         self.data, self.slices = torch.load(path)
 
     @property
-    def raw_file_names(self):
+    def raw_file_names(self) -> str:
         return 'MPI-FAUST.zip'
 
     @property
-    def processed_file_names(self):
+    def processed_file_names(self) -> List[str]:
         return ['training.pt', 'test.pt']
 
     def download(self):
         raise RuntimeError(
-            'Dataset not found. Please download {} from {} and move it to {}'.
-            format(self.raw_file_names, self.url, self.raw_dir))
+            f"Dataset not found. Please download '{self.raw_file_names}' from "
+            f"'{self.url}' and move it to '{self.raw_dir}'")
 
     def process(self):
         extract_zip(self.raw_paths[0], self.raw_dir, log=False)

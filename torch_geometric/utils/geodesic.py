@@ -1,18 +1,20 @@
-import torch
+import multiprocessing as mp
+from typing import Optional
+
 import numpy as np
-
-try:
-    import gdist
-except ImportError:
-    gdist = None
+import torch
+from torch import Tensor
 
 
-def geodesic_distance(pos,
-                      face,
-                      src=None,
-                      dest=None,
-                      norm=True,
-                      max_distance=None):
+def geodesic_distance(
+    pos: Tensor,
+    face: Tensor,
+    src: Optional[Tensor] = None,
+    dest: Optional[Tensor] = None,
+    norm: bool = True,
+    max_distance: Optional[float] = None,
+    num_workers: int = 0,
+) -> Tensor:
     r"""Computes (normalized) geodesic distances of a mesh given by :obj:`pos`
     and :obj:`face`. If :obj:`src` and :obj:`dest` are given, this method only
     computes the geodesic distances for the respective source and target
@@ -35,40 +37,74 @@ def geodesic_distance(pos,
         max_distance (float, optional): If given, only yields results for
             geodesic distances less than :obj:`max_distance`. This will speed
             up runtime dramatically. (default: :obj:`None`)
+        num_workers (int, optional): How many subprocesses to use for
+            calculating geodesic distances.
+            :obj:`0` means that computation takes place in the main process.
+            :obj:`-1` means that the available amount of CPU cores is used.
+            (default: :obj:`0`)
 
-    :rtype: Tensor
+    :rtype: :class:`Tensor`
+
+    Example:
+
+        >>> pos = torch.Tensor([[0, 0, 0],
+        ...                     [2, 0, 0],
+        ...                     [0, 2, 0],
+        ...                     [2, 2, 0]])
+        >>> face = torch.tensor([[0, 0],
+        ...                      [1, 2],
+        ...                      [3, 3]])
+        >>> geodesic_distance(pos, face)
+        [[0, 1, 1, 1.4142135623730951],
+        [1, 0, 1.4142135623730951, 1],
+        [1, 1.4142135623730951, 0, 1],
+        [1.4142135623730951, 1, 1, 0]]
     """
-
-    if gdist is None:
-        raise ImportError('Package "gdist" could not be found.')
+    import gdist
 
     max_distance = float('inf') if max_distance is None else max_distance
 
     if norm:
         area = (pos[face[1]] - pos[face[0]]).cross(pos[face[2]] - pos[face[0]])
         norm = (area.norm(p=2, dim=1) / 2).sum().sqrt().item()
-    else:  # pragma: no cover
+    else:
         norm = 1.0
 
+    dtype = pos.dtype
+
+    pos = pos.detach().cpu().to(torch.double).numpy()
+    face = face.detach().t().cpu().to(torch.int).numpy()
+
+    if src is None and dest is None:
+        out = gdist.local_gdist_matrix(pos, face,
+                                       max_distance * norm).toarray() / norm
+        return torch.from_numpy(out).to(dtype)
+
     if src is None:
-        src = np.arange(pos.size(0), dtype=np.int32)
+        src = np.arange(pos.shape[0], dtype=np.int32)
     else:
         src = src.detach().cpu().to(torch.int).numpy()
 
     dest = None if dest is None else dest.detach().cpu().to(torch.int).numpy()
 
-    dtype = pos.dtype
-    pos = pos.detach().cpu().to(torch.double).numpy()
-    face = face.detach().t().cpu().to(torch.int).numpy()
-
-    outs = []
-    for i in range(len(src)):
+    def _parallel_loop(pos, face, src, dest, max_distance, norm, i, dtype):
         s = src[i:i + 1]
         d = None if dest is None else dest[i:i + 1]
-
         out = gdist.compute_gdist(pos, face, s, d, max_distance * norm) / norm
-        out = torch.from_numpy(out).to(dtype)
-        outs.append(out)
+        return torch.from_numpy(out).to(dtype)
+
+    num_workers = mp.cpu_count() if num_workers <= -1 else num_workers
+    if num_workers > 0:
+        with mp.Pool(num_workers) as pool:
+            outs = pool.starmap(
+                _parallel_loop,
+                [(pos, face, src, dest, max_distance, norm, i, dtype)
+                 for i in range(len(src))])
+    else:
+        outs = [
+            _parallel_loop(pos, face, src, dest, max_distance, norm, i, dtype)
+            for i in range(len(src))
+        ]
 
     out = torch.cat(outs, dim=0)
 

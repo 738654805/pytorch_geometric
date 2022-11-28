@@ -3,12 +3,13 @@ from math import ceil
 import torch
 import torch.nn.functional as F
 from torch.nn import Linear
-from torch_geometric.nn import DenseSAGEConv, dense_diff_pool, JumpingKnowledge
+
+from torch_geometric.nn import DenseSAGEConv, JumpingKnowledge, dense_diff_pool
 
 
 class Block(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, mode='cat'):
-        super(Block, self).__init__()
+        super().__init__()
 
         self.conv1 = DenseSAGEConv(in_channels, hidden_channels)
         self.conv2 = DenseSAGEConv(hidden_channels, out_channels)
@@ -23,15 +24,15 @@ class Block(torch.nn.Module):
         self.conv2.reset_parameters()
         self.lin.reset_parameters()
 
-    def forward(self, x, adj, mask=None, add_loop=True):
-        x1 = F.relu(self.conv1(x, adj, mask, add_loop))
-        x2 = F.relu(self.conv2(x1, adj, mask, add_loop))
+    def forward(self, x, adj, mask=None):
+        x1 = F.relu(self.conv1(x, adj, mask))
+        x2 = F.relu(self.conv2(x1, adj, mask))
         return self.lin(self.jump([x1, x2]))
 
 
 class DiffPool(torch.nn.Module):
     def __init__(self, dataset, num_layers, hidden, ratio=0.25):
-        super(DiffPool, self).__init__()
+        super().__init__()
 
         num_nodes = ceil(ratio * dataset[0].num_nodes)
         self.embed_block1 = Block(dataset.num_features, hidden, hidden)
@@ -62,8 +63,8 @@ class DiffPool(torch.nn.Module):
     def forward(self, data):
         x, adj, mask = data.x, data.adj, data.mask
 
-        s = self.pool_block1(x, adj, mask, add_loop=True)
-        x = F.relu(self.embed_block1(x, adj, mask, add_loop=True))
+        s = self.pool_block1(x, adj, mask)
+        x = F.relu(self.embed_block1(x, adj, mask))
         xs = [x.mean(dim=1)]
         x, adj, _, _ = dense_diff_pool(x, adj, s, mask)
 

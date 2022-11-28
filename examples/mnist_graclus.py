@@ -2,16 +2,23 @@ import os.path as osp
 
 import torch
 import torch.nn.functional as F
-from torch_geometric.datasets import MNISTSuperpixels
+
 import torch_geometric.transforms as T
-from torch_geometric.data import DataLoader
+from torch_geometric.datasets import MNISTSuperpixels
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import (
+    SplineConv,
+    global_mean_pool,
+    graclus,
+    max_pool,
+    max_pool_x,
+)
 from torch_geometric.utils import normalized_cut
-from torch_geometric.nn import (SplineConv, graclus, max_pool, max_pool_x,
-                                global_mean_pool)
 
 path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'data', 'MNIST')
-train_dataset = MNISTSuperpixels(path, True, transform=T.Cartesian())
-test_dataset = MNISTSuperpixels(path, False, transform=T.Cartesian())
+transform = T.Cartesian(cat=False)
+train_dataset = MNISTSuperpixels(path, True, transform=transform)
+test_dataset = MNISTSuperpixels(path, False, transform=transform)
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=64)
 d = train_dataset
@@ -25,7 +32,7 @@ def normalized_cut_2d(edge_index, pos):
 
 class Net(torch.nn.Module):
     def __init__(self):
-        super(Net, self).__init__()
+        super().__init__()
         self.conv1 = SplineConv(d.num_features, 32, dim=2, kernel_size=5)
         self.conv2 = SplineConv(32, 64, dim=2, kernel_size=5)
         self.fc1 = torch.nn.Linear(64, 128)
@@ -36,7 +43,7 @@ class Net(torch.nn.Module):
         weight = normalized_cut_2d(data.edge_index, data.pos)
         cluster = graclus(data.edge_index, weight, data.x.size(0))
         data.edge_attr = None
-        data = max_pool(cluster, data, transform=T.Cartesian(cat=False))
+        data = max_pool(cluster, data, transform=transform)
 
         data.x = F.elu(self.conv2(data.x, data.edge_index, data.edge_attr))
         weight = normalized_cut_2d(data.edge_index, data.pos)
@@ -86,4 +93,4 @@ def test():
 for epoch in range(1, 31):
     train(epoch)
     test_acc = test()
-    print('Epoch: {:02d}, Test: {:.4f}'.format(epoch, test_acc))
+    print(f'Epoch: {epoch:02d}, Test: {test_acc:.4f}')

@@ -1,35 +1,83 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
-__version__ = '1.3.0'
-url = 'https://github.com/rusty1s/pytorch_geometric'
+__version__ = '2.1.0'
+URL = 'https://github.com/pyg-team/pytorch_geometric'
 
 install_requires = [
+    'tqdm',
     'numpy',
     'scipy',
-    'networkx',
+    'jinja2',
+    'requests',
+    'pyparsing',
     'scikit-learn',
-    'plyfile',
-    'pandas',
-    'rdflib',
-    'h5py',
+    'psutil>=5.8.0',
 ]
-setup_requires = ['pytest-runner']
-tests_require = ['pytest', 'pytest-cov', 'mock']
+
+graphgym_requires = [
+    'yacs',
+    'hydra-core',
+    'protobuf<4.21',
+    'pytorch-lightning',
+]
+
+full_requires = graphgym_requires + [
+    'ase',
+    'h5py',
+    'numba',
+    'sympy',
+    'pandas',
+    'captum',
+    'rdflib',
+    'trimesh',
+    'networkx',
+    'tabulate',
+    'matplotlib',
+    'scikit-image',
+    'pytorch-memlab',
+    'torchmetrics>=0.7',
+]
+
+benchmark_requires = [
+    'protobuf<4.21',
+    'wandb',
+]
+
+test_requires = [
+    'pytest',
+    'pytest-cov',
+    'onnx',
+    'onnxruntime',
+]
+
+dev_requires = test_requires + [
+    'pre-commit',
+]
 
 setup(
     name='torch_geometric',
     version=__version__,
-    description='Geometric Deep Learning Extension Library for PyTorch',
+    description='Graph Neural Network Library for PyTorch',
     author='Matthias Fey',
     author_email='matthias.fey@tu-dortmund.de',
-    url=url,
-    download_url='{}/archive/{}.tar.gz'.format(url, __version__),
+    url=URL,
+    download_url=f'{URL}/archive/{__version__}.tar.gz',
     keywords=[
+        'deep-learning',
         'pytorch',
         'geometric-deep-learning',
         'graph-neural-networks',
+        'graph-convolutional-networks',
     ],
+    python_requires='>=3.7',
     install_requires=install_requires,
-    setup_requires=setup_requires,
-    tests_require=tests_require,
-    packages=find_packages())
+    extras_require={
+        'graphgym': graphgym_requires,
+        'full': full_requires,
+        'benchmark': benchmark_requires,
+        'test': test_requires,
+        'dev': dev_requires,
+    },
+    packages=find_packages(),
+    include_package_data=True,  # Ensure that `*.jinja` files are found.
+)

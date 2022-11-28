@@ -2,12 +2,12 @@ import os.path as osp
 
 import torch
 import torch.nn.functional as F
-from torch.nn import Sequential, Linear, ReLU, GRU
+from torch.nn import GRU, Linear, ReLU, Sequential
 
 import torch_geometric.transforms as T
 from torch_geometric.datasets import QM9
+from torch_geometric.loader import DataLoader
 from torch_geometric.nn import NNConv, Set2Set
-from torch_geometric.data import DataLoader
 from torch_geometric.utils import remove_self_loops
 
 target = 0
@@ -52,26 +52,27 @@ transform = T.Compose([MyTransform(), Complete(), T.Distance(norm=False)])
 dataset = QM9(path, transform=transform).shuffle()
 
 # Normalize targets to mean = 0 and std = 1.
-mean = dataset.data.y[:, target].mean().item()
-std = dataset.data.y[:, target].std().item()
-dataset.data.y[:, target] = (dataset.data.y[:, target] - mean) / std
+mean = dataset.data.y.mean(dim=0, keepdim=True)
+std = dataset.data.y.std(dim=0, keepdim=True)
+dataset.data.y = (dataset.data.y - mean) / std
+mean, std = mean[:, target].item(), std[:, target].item()
 
 # Split datasets.
 test_dataset = dataset[:10000]
 val_dataset = dataset[10000:20000]
 train_dataset = dataset[20000:]
-test_loader = DataLoader(test_dataset, batch_size=64)
-val_loader = DataLoader(val_dataset, batch_size=64)
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
 
 
 class Net(torch.nn.Module):
     def __init__(self):
-        super(Net, self).__init__()
+        super().__init__()
         self.lin0 = torch.nn.Linear(dataset.num_features, dim)
 
         nn = Sequential(Linear(5, 128), ReLU(), Linear(128, dim * dim))
-        self.conv = NNConv(dim, dim, nn, aggr='mean', root_weight=False)
+        self.conv = NNConv(dim, dim, nn, aggr='mean')
         self.gru = GRU(dim, dim)
 
         self.set2set = Set2Set(dim, processing_steps=3)
@@ -96,8 +97,9 @@ class Net(torch.nn.Module):
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = Net().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='min', factor=0.7, patience=5, min_lr=0.00001)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
+                                                       factor=0.7, patience=5,
+                                                       min_lr=0.00001)
 
 
 def train(epoch):
@@ -135,5 +137,5 @@ for epoch in range(1, 301):
         test_error = test(test_loader)
         best_val_error = val_error
 
-    print('Epoch: {:03d}, LR: {:7f}, Loss: {:.7f}, Validation MAE: {:.7f}, '
-          'Test MAE: {:.7f}'.format(epoch, lr, loss, val_error, test_error))
+    print(f'Epoch: {epoch:03d}, LR: {lr:7f}, Loss: {loss:.7f}, '
+          f'Val MAE: {val_error:.7f}, Test MAE: {test_error:.7f}')

@@ -1,11 +1,17 @@
 import torch
-from torch_sparse import coalesce
 from torch_scatter import scatter_add
+from torch_sparse import coalesce
+
+from torch_geometric.data import Data
+from torch_geometric.data.datapipes import functional_transform
+from torch_geometric.transforms import BaseTransform
 from torch_geometric.utils import remove_self_loops
 
 
-class LineGraph(object):
-    r"""Converts a graph to its corresponding line-graph:
+@functional_transform('line_graph')
+class LineGraph(BaseTransform):
+    r"""Converts a graph to its corresponding line-graph
+    (functional name: :obj:`line_graph`):
 
     .. math::
         L(\mathcal{G}) &= (\mathcal{V}^{\prime}, \mathcal{E}^{\prime})
@@ -27,11 +33,10 @@ class LineGraph(object):
         force_directed (bool, optional): If set to :obj:`True`, the graph will
             be always treated as a directed graph. (default: :obj:`False`)
     """
-
-    def __init__(self, force_directed=False):
+    def __init__(self, force_directed: bool = False):
         self.force_directed = force_directed
 
-    def __call__(self, data):
+    def __call__(self, data: Data) -> Data:
         N = data.num_nodes
         edge_index, edge_attr = data.edge_index, data.edge_attr
         (row, col), edge_attr = coalesce(edge_index, edge_attr, N, N)
@@ -39,8 +44,8 @@ class LineGraph(object):
         if self.force_directed or data.is_directed():
             i = torch.arange(row.size(0), dtype=torch.long, device=row.device)
 
-            count = scatter_add(
-                torch.ones_like(row), row, dim=0, dim_size=data.num_nodes)
+            count = scatter_add(torch.ones_like(row), row, dim=0,
+                                dim_size=data.num_nodes)
             cumsum = torch.cat([count.new_zeros(1), count.cumsum(0)], dim=0)
 
             cols = [
@@ -53,6 +58,7 @@ class LineGraph(object):
 
             data.edge_index = torch.stack([row, col], dim=0)
             data.x = data.edge_attr
+            data.num_nodes = edge_index.size(1)
 
         else:
             # Compute node indices.
@@ -64,12 +70,11 @@ class LineGraph(object):
                 torch.stack([
                     torch.cat([row, col], dim=0),
                     torch.cat([col, row], dim=0)
-                ],
-                            dim=0), torch.cat([i, i], dim=0), N, N)
+                ], dim=0), torch.cat([i, i], dim=0), N, N)
 
             # Compute new edge indices according to `i`.
-            count = scatter_add(
-                torch.ones_like(row), row, dim=0, dim_size=data.num_nodes)
+            count = scatter_add(torch.ones_like(row), row, dim=0,
+                                dim_size=data.num_nodes)
             joints = torch.split(i, count.tolist())
 
             def generate_grid(x):
@@ -86,9 +91,7 @@ class LineGraph(object):
             if edge_attr is not None:
                 data.x = scatter_add(edge_attr, i, dim=0, dim_size=N)
             data.edge_index = joints
+            data.num_nodes = edge_index.size(1) // 2
 
         data.edge_attr = None
         return data
-
-    def __repr__(self):
-        return '{}()'.format(self.__class__.__name__)

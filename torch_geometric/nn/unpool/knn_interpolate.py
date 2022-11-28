@@ -1,9 +1,13 @@
 import torch
-from torch_geometric.nn import knn
 from torch_scatter import scatter_add
 
+from torch_geometric.nn import knn
+from torch_geometric.typing import OptTensor
 
-def knn_interpolate(x, pos_x, pos_y, batch_x=None, batch_y=None, k=3):
+
+def knn_interpolate(x: torch.Tensor, pos_x: torch.Tensor, pos_y: torch.Tensor,
+                    batch_x: OptTensor = None, batch_y: OptTensor = None,
+                    k: int = 3, num_workers: int = 1):
     r"""The k-NN interpolation from the `"PointNet++: Deep Hierarchical
     Feature Learning on Point Sets in a Metric Space"
     <https://arxiv.org/abs/1706.02413>`_ paper.
@@ -34,11 +38,15 @@ def knn_interpolate(x, pos_x, pos_y, batch_x=None, batch_y=None, k=3):
             each node from :math:`\mathbf{Y}` to a specific example.
             (default: :obj:`None`)
         k (int, optional): Number of neighbors. (default: :obj:`3`)
+        num_workers (int): Number of workers to use for computation. Has no
+            effect in case :obj:`batch_x` or :obj:`batch_y` is not
+            :obj:`None`, or the input lies on the GPU. (default: :obj:`1`)
     """
 
     with torch.no_grad():
-        assign_index = knn(pos_x, pos_y, k, batch_x=batch_x, batch_y=batch_y)
-        y_idx, x_idx = assign_index
+        assign_index = knn(pos_x, pos_y, k, batch_x=batch_x, batch_y=batch_y,
+                           num_workers=num_workers)
+        y_idx, x_idx = assign_index[0], assign_index[1]
         diff = pos_x[x_idx] - pos_y[y_idx]
         squared_distance = (diff * diff).sum(dim=-1, keepdim=True)
         weights = 1.0 / torch.clamp(squared_distance, min=1e-16)

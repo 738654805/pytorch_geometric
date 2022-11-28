@@ -1,12 +1,18 @@
 import torch
-from torch_scatter import scatter_min, scatter_max, scatter_mean, scatter_std
+from torch_scatter import scatter_max, scatter_mean, scatter_min, scatter_std
+
+from torch_geometric.data import Data
+from torch_geometric.data.datapipes import functional_transform
+from torch_geometric.transforms import BaseTransform
 from torch_geometric.utils import degree
 
 
-class LocalDegreeProfile(object):
+@functional_transform('local_degree_profile')
+class LocalDegreeProfile(BaseTransform):
     r"""Appends the Local Degree Profile (LDP) from the `"A Simple yet
     Effective Baseline for Non-attribute Graph Classification"
     <https://arxiv.org/abs/1811.03508>`_ paper
+    (functional name: :obj:`local_degree_profile`)
 
     .. math::
         \mathbf{x}_i = \mathbf{x}_i \, \Vert \, (\deg(i), \min(DN(i)),
@@ -15,19 +21,17 @@ class LocalDegreeProfile(object):
     to the node features, where :math:`DN(i) = \{ \deg(j) \mid j \in
     \mathcal{N}(i) \}`.
     """
-
-    def __call__(self, data):
+    def __call__(self, data: Data) -> Data:
         row, col = data.edge_index
         N = data.num_nodes
 
         deg = degree(row, N, dtype=torch.float)
         deg_col = deg[col]
 
-        value = 1e9
-        min_deg, _ = scatter_min(deg_col, row, dim_size=N, fill_value=value)
-        min_deg[min_deg == value] = 0
-        max_deg, _ = scatter_max(deg_col, row, dim_size=N, fill_value=-value)
-        max_deg[max_deg == -value] = 0
+        min_deg, _ = scatter_min(deg_col, row, dim_size=N)
+        min_deg[min_deg > 10000] = 0
+        max_deg, _ = scatter_max(deg_col, row, dim_size=N)
+        max_deg[max_deg < -10000] = 0
         mean_deg = scatter_mean(deg_col, row, dim_size=N)
         std_deg = scatter_std(deg_col, row, dim_size=N)
 
@@ -40,6 +44,3 @@ class LocalDegreeProfile(object):
             data.x = x
 
         return data
-
-    def __repr__(self):
-        return '{}()'.format(self.__class__.__name__)

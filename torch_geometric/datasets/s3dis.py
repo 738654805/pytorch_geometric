@@ -1,17 +1,22 @@
 import os
 import os.path as osp
 import shutil
+from typing import Callable, List, Optional
 
-import h5py
 import torch
-from torch_geometric.data import (InMemoryDataset, Data, download_url,
-                                  extract_zip)
+
+from torch_geometric.data import (
+    Data,
+    InMemoryDataset,
+    download_url,
+    extract_zip,
+)
 
 
 class S3DIS(InMemoryDataset):
     r"""The (pre-processed) Stanford Large-Scale 3D Indoor Spaces dataset from
     the `"3D Semantic Parsing of Large-Scale Indoor Spaces"
-    <http://buildingparser.stanford.edu/images/3D_Semantic_Parsing.pdf>`_
+    <https://openaccess.thecvf.com/content_cvpr_2016/papers/Armeni_3D_Semantic_Parsing_CVPR_2016_paper.pdf>`_
     paper, containing point clouds of six large-scale indoor parts in three
     buildings with 12 semantic elements (and one clutter class).
 
@@ -38,37 +43,40 @@ class S3DIS(InMemoryDataset):
     url = ('https://shapenet.cs.stanford.edu/media/'
            'indoor3d_sem_seg_hdf5_data.zip')
 
-    def __init__(self,
-                 root,
-                 test_area=6,
-                 train=True,
-                 transform=None,
-                 pre_transform=None,
-                 pre_filter=None):
+    def __init__(
+        self,
+        root: str,
+        test_area: int = 6,
+        train: bool = True,
+        transform: Optional[Callable] = None,
+        pre_transform: Optional[Callable] = None,
+        pre_filter: Optional[Callable] = None,
+    ):
         assert test_area >= 1 and test_area <= 6
         self.test_area = test_area
-        super(S3DIS, self).__init__(root, transform, pre_transform, pre_filter)
+        super().__init__(root, transform, pre_transform, pre_filter)
         path = self.processed_paths[0] if train else self.processed_paths[1]
         self.data, self.slices = torch.load(path)
 
     @property
-    def raw_file_names(self):
+    def raw_file_names(self) -> List[str]:
         return ['all_files.txt', 'room_filelist.txt']
 
     @property
-    def processed_file_names(self):
-        test_area = self.test_area
-        return ['{}_{}.pt'.format(s, test_area) for s in ['train', 'test']]
+    def processed_file_names(self) -> List[str]:
+        return [f'{split}_{self.test_area}.pt' for split in ['train', 'test']]
 
     def download(self):
         path = download_url(self.url, self.root)
         extract_zip(path, self.root)
         os.unlink(path)
         shutil.rmtree(self.raw_dir)
-        name = self.url.split(os.sep)[-1].split('.')[0]
+        name = self.url.split('/')[-1].split('.')[0]
         os.rename(osp.join(self.root, name), self.raw_dir)
 
     def process(self):
+        import h5py
+
         with open(self.raw_paths[0], 'r') as f:
             filenames = [x.split('/')[-1] for x in f.read().split('\n')[:-1]]
 
@@ -81,7 +89,7 @@ class S3DIS(InMemoryDataset):
             xs += torch.from_numpy(f['data'][:]).unbind(0)
             ys += torch.from_numpy(f['label'][:]).to(torch.long).unbind(0)
 
-        test_area = 'Area_{}'.format(self.test_area)
+        test_area = f'Area_{self.test_area}'
         train_data_list, test_data_list = [], []
         for i, (x, y) in enumerate(zip(xs, ys)):
             data = Data(pos=x[:, :3], x=x[:, 3:], y=y)

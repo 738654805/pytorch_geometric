@@ -1,12 +1,19 @@
+from typing import Callable, Optional
+
 import torch
-from torch.nn import Parameter
 import torch.nn.functional as F
-from torch_scatter import scatter_add
+from torch import Tensor, nn
+from torch.nn import Parameter, ReLU
+from torch_sparse import SparseTensor, matmul
+
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.nn.conv.gcn_conv import gcn_norm
+from torch_geometric.typing import Adj, OptTensor
 
 from ..inits import glorot, zeros
 
 
-class ARMAConv(torch.nn.Module):
+class ARMAConv(MessagePassing):
     r"""The ARMA graph convolutional operator from the `"Graph Neural Networks
     with Convolutional ARMA Filters" <https://arxiv.org/abs/1901.01343>`_ paper
 
@@ -25,33 +32,39 @@ class ARMAConv(torch.nn.Module):
     \mathbf{A} \mathbf{D}^{-1/2}`.
 
     Args:
-        in_channels (int): Size of each input sample :math:`\mathbf{x}^{(t)}`.
+        in_channels (int): Size of each input sample, or :obj:`-1` to derive
+            the size from the first input(s) to the forward method.
         out_channels (int): Size of each output sample
             :math:`\mathbf{x}^{(t+1)}`.
         num_stacks (int, optional): Number of parallel stacks :math:`K`.
             (default: :obj:`1`).
         num_layers (int, optional): Number of layers :math:`T`.
             (default: :obj:`1`)
-        act (callable, optional): Activiation function :math:`\sigma`.
-            (default: :meth:`torch.nn.functional.ReLU`)
+        act (callable, optional): Activation function :math:`\sigma`.
+            (default: :meth:`torch.nn.ReLU()`)
         shared_weights (int, optional): If set to :obj:`True` the layers in
             each stack will share the same parameters. (default: :obj:`False`)
         dropout (float, optional): Dropout probability of the skip connection.
-            (default: :obj:`0`)
+            (default: :obj:`0.`)
         bias (bool, optional): If set to :obj:`False`, the layer will not learn
             an additive bias. (default: :obj:`True`)
-    """
+        **kwargs (optional): Additional arguments of
+            :class:`torch_geometric.nn.conv.MessagePassing`.
 
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 num_stacks=1,
-                 num_layers=1,
-                 shared_weights=False,
-                 act=F.relu,
-                 dropout=0,
-                 bias=True):
-        super(ARMAConv, self).__init__()
+    Shapes:
+        - **input:**
+          node features :math:`(|\mathcal{V}|, F_{in})`,
+          edge indices :math:`(2, |\mathcal{E}|)`,
+          edge weights :math:`(|\mathcal{E}|)` *(optional)*
+        - **output:** node features :math:`(|\mathcal{V}|, F_{out})`
+    """
+    def __init__(self, in_channels: int, out_channels: int,
+                 num_stacks: int = 1, num_layers: int = 1,
+                 shared_weights: bool = False,
+                 act: Optional[Callable] = ReLU(), dropout: float = 0.,
+                 bias: bool = True, **kwargs):
+        kwargs.setdefault('aggr', 'add')
+        super().__init__(**kwargs)
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -62,72 +75,90 @@ class ARMAConv(torch.nn.Module):
         self.dropout = dropout
 
         K, T, F_in, F_out = num_stacks, num_layers, in_channels, out_channels
+        T = 1 if self.shared_weights else T
 
-        w = torch.nn.Parameter(torch.Tensor(K, F_in, F_out))
-        self.ws = torch.nn.ParameterList([w])
-        for i in range(min(1, T - 1) if shared_weights else T - 1):
-            self.ws.append(Parameter(torch.Tensor(K, F_out, F_out)))
-
-        self.vs = torch.nn.ParameterList([])
-        for i in range(1 if shared_weights else T):
-            self.vs.append(Parameter(torch.Tensor(K, F_in, F_out)))
+        self.weight = Parameter(torch.Tensor(max(1, T - 1), K, F_out, F_out))
+        if in_channels > 0:
+            self.init_weight = Parameter(torch.Tensor(K, F_in, F_out))
+            self.root_weight = Parameter(torch.Tensor(T, K, F_in, F_out))
+        else:
+            self.init_weight = torch.nn.parameter.UninitializedParameter()
+            self.root_weight = torch.nn.parameter.UninitializedParameter()
+            self._hook = self.register_forward_pre_hook(
+                self.initialize_parameters)
 
         if bias:
-            self.bias = torch.nn.ParameterList([])
-            for i in range(1 if shared_weights else T):
-                self.bias.append(Parameter(torch.Tensor(K, 1, F_out)))
+            self.bias = Parameter(torch.Tensor(T, K, 1, F_out))
         else:
             self.register_parameter('bias', None)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        for w in self.ws:
-            glorot(w)
-        for v in self.vs:
-            glorot(v)
-        if self.bias is not None:
-            for bias in self.bias:
-                zeros(bias)
+        glorot(self.weight)
+        if not isinstance(self.init_weight, torch.nn.UninitializedParameter):
+            glorot(self.init_weight)
+            glorot(self.root_weight)
+        zeros(self.bias)
 
-    def forward(self, x, edge_index, edge_weight=None):
+    def forward(self, x: Tensor, edge_index: Adj,
+                edge_weight: OptTensor = None) -> Tensor:
         """"""
-        if edge_weight is None:
-            edge_weight = x.new_ones((edge_index.size(1), ))
-        edge_weight = edge_weight.view(-1)
-        assert edge_weight.size(0) == edge_index.size(1)
 
-        row, col = edge_index
-        deg = scatter_add(edge_weight, row, dim=0, dim_size=x.size(0))
-        deg_inv = deg.pow(-0.5)
-        deg_inv[deg_inv == float('inf')] = 0
+        if isinstance(edge_index, Tensor):
+            edge_index, edge_weight = gcn_norm(  # yapf: disable
+                edge_index, edge_weight, x.size(self.node_dim),
+                add_self_loops=False, flow=self.flow, dtype=x.dtype)
 
-        lap = deg_inv[row] * edge_weight * deg_inv[col]
+        elif isinstance(edge_index, SparseTensor):
+            edge_index = gcn_norm(  # yapf: disable
+                edge_index, edge_weight, x.size(self.node_dim),
+                add_self_loops=False, flow=self.flow, dtype=x.dtype)
 
-        x = x.unsqueeze(0)
+        x = x.unsqueeze(-3)
         out = x
         for t in range(self.num_layers):
-            w = self.ws[min(t, 1) if self.shared_weights else t]
-            out = torch.matmul(out, w)
-            out = out[:, col] * lap.view(1, -1, 1)
-            out = scatter_add(out, row, dim=1, dim_size=x.size(1))
+            if t == 0:
+                out = out @ self.init_weight
+            else:
+                out = out @ self.weight[0 if self.shared_weights else t - 1]
 
-            skip = F.dropout(x, p=self.dropout, training=self.training)
-            v = self.vs[0 if self.shared_weights else t]
-            skip = torch.matmul(skip, v)
+            # propagate_type: (x: Tensor, edge_weight: OptTensor)
+            out = self.propagate(edge_index, x=out, edge_weight=edge_weight,
+                                 size=None)
 
-            out = out + skip
+            root = F.dropout(x, p=self.dropout, training=self.training)
+            root = root @ self.root_weight[0 if self.shared_weights else t]
+            out = out + root
 
             if self.bias is not None:
-                bias = self.bias[0 if self.shared_weights else t]
-                out = out + bias
+                out = out + self.bias[0 if self.shared_weights else t]
 
-            if self.act:
+            if self.act is not None:
                 out = self.act(out)
 
-        return out.mean(dim=0)
+        return out.mean(dim=-3)
 
-    def __repr__(self):
-        return '{}({}, {}, num_stacks={}, num_layers={})'.format(
-            self.__class__.__name__, self.in_channels, self.out_channels,
-            self.num_stacks, self.num_layers)
+    def message(self, x_j: Tensor, edge_weight: Tensor) -> Tensor:
+        return edge_weight.view(-1, 1) * x_j
+
+    def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
+        return matmul(adj_t, x, reduce=self.aggr)
+
+    @torch.no_grad()
+    def initialize_parameters(self, module, input):
+        if isinstance(self.init_weight, nn.parameter.UninitializedParameter):
+            F_in, F_out = input[0].size(-1), self.out_channels
+            T, K = self.weight.size(0) + 1, self.weight.size(1)
+            self.init_weight.materialize((K, F_in, F_out))
+            self.root_weight.materialize((T, K, F_in, F_out))
+            glorot(self.init_weight)
+            glorot(self.root_weight)
+
+        module._hook.remove()
+        delattr(module, '_hook')
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'{self.out_channels}, num_stacks={self.num_stacks}, '
+                f'num_layers={self.num_layers})')

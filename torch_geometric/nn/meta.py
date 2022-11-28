@@ -1,4 +1,7 @@
+from typing import Optional, Tuple
+
 import torch
+from torch import Tensor
 
 
 class MetaLayer(torch.nn.Module):
@@ -40,11 +43,11 @@ class MetaLayer(torch.nn.Module):
 
         class EdgeModel(torch.nn.Module):
             def __init__(self):
-                super(EdgeModel, self).__init__()
+                super().__init__()
                 self.edge_mlp = Seq(Lin(..., ...), ReLU(), Lin(..., ...))
 
             def forward(self, src, dest, edge_attr, u, batch):
-                # source, target: [E, F_x], where E is the number of edges.
+                # src, dest: [E, F_x], where E is the number of edges.
                 # edge_attr: [E, F_e]
                 # u: [B, F_u], where B is the number of graphs.
                 # batch: [E] with max entry B - 1.
@@ -53,7 +56,7 @@ class MetaLayer(torch.nn.Module):
 
         class NodeModel(torch.nn.Module):
             def __init__(self):
-                super(NodeModel, self).__init__()
+                super().__init__()
                 self.node_mlp_1 = Seq(Lin(..., ...), ReLU(), Lin(..., ...))
                 self.node_mlp_2 = Seq(Lin(..., ...), ReLU(), Lin(..., ...))
 
@@ -64,15 +67,15 @@ class MetaLayer(torch.nn.Module):
                 # u: [B, F_u]
                 # batch: [N] with max entry B - 1.
                 row, col = edge_index
-                out = torch.cat([x[col], edge_attr], dim=1)
+                out = torch.cat([x[row], edge_attr], dim=1)
                 out = self.node_mlp_1(out)
-                out = scatter_mean(out, row, dim=0, dim_size=x.size(0))
+                out = scatter_mean(out, col, dim=0, dim_size=x.size(0))
                 out = torch.cat([x, out, u[batch]], dim=1)
                 return self.node_mlp_2(out)
 
         class GlobalModel(torch.nn.Module):
             def __init__(self):
-                super(GlobalModel, self).__init__()
+                super().__init__()
                 self.global_mlp = Seq(Lin(..., ...), ReLU(), Lin(..., ...))
 
             def forward(self, x, edge_index, edge_attr, u, batch):
@@ -87,9 +90,13 @@ class MetaLayer(torch.nn.Module):
         op = MetaLayer(EdgeModel(), NodeModel(), GlobalModel())
         x, edge_attr, u = op(x, edge_index, edge_attr, u, batch)
     """
-
-    def __init__(self, edge_model=None, node_model=None, global_model=None):
-        super(MetaLayer, self).__init__()
+    def __init__(
+        self,
+        edge_model: Optional[torch.nn.Module] = None,
+        node_model: Optional[torch.nn.Module] = None,
+        global_model: Optional[torch.nn.Module] = None,
+    ):
+        super().__init__()
         self.edge_model = edge_model
         self.node_model = node_model
         self.global_model = global_model
@@ -101,9 +108,17 @@ class MetaLayer(torch.nn.Module):
             if hasattr(item, 'reset_parameters'):
                 item.reset_parameters()
 
-    def forward(self, x, edge_index, edge_attr=None, u=None, batch=None):
+    def forward(
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        edge_attr: Optional[Tensor] = None,
+        u: Optional[Tensor] = None,
+        batch: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         """"""
-        row, col = edge_index
+        row = edge_index[0]
+        col = edge_index[1]
 
         if self.edge_model is not None:
             edge_attr = self.edge_model(x[row], x[col], edge_attr, u,
@@ -117,10 +132,9 @@ class MetaLayer(torch.nn.Module):
 
         return x, edge_attr, u
 
-    def __repr__(self):
-        return ('{}(\n'
-                '    edge_model={},\n'
-                '    node_model={},\n'
-                '    global_model={}\n'
-                ')').format(self.__class__.__name__, self.edge_model,
-                            self.node_model, self.global_model)
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}(\n'
+                f'  edge_model={self.edge_model},\n'
+                f'  node_model={self.node_model},\n'
+                f'  global_model={self.global_model}\n'
+                f')')

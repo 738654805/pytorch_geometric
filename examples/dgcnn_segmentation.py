@@ -2,58 +2,51 @@ import os.path as osp
 
 import torch
 import torch.nn.functional as F
-from torch.nn import Sequential as Seq, Dropout, Linear as Lin
-from torch_geometric.datasets import ShapeNet
+from torch_scatter import scatter
+from torchmetrics.functional import jaccard_index
+
 import torch_geometric.transforms as T
-from torch_geometric.data import DataLoader
-from torch_geometric.nn import DynamicEdgeConv
-from torch_geometric.utils import intersection_and_union as i_and_u
+from torch_geometric.datasets import ShapeNet
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import MLP, DynamicEdgeConv
 
-from pointnet2_classification import MLP
-
-category = 'Airplane'
+category = 'Airplane'  # Pass in `None` to train on all categories.
 path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'data', 'ShapeNet')
 transform = T.Compose([
-    T.RandomTranslate(0.01),
+    T.RandomJitter(0.01),
     T.RandomRotate(15, axis=0),
     T.RandomRotate(15, axis=1),
     T.RandomRotate(15, axis=2)
 ])
 pre_transform = T.NormalizeScale()
-train_dataset = ShapeNet(
-    path,
-    category,
-    train=True,
-    transform=transform,
-    pre_transform=pre_transform)
-test_dataset = ShapeNet(
-    path, category, train=False, pre_transform=pre_transform)
-train_loader = DataLoader(
-    train_dataset, batch_size=10, shuffle=True, num_workers=6)
-test_loader = DataLoader(
-    test_dataset, batch_size=10, shuffle=False, num_workers=6)
+train_dataset = ShapeNet(path, category, split='trainval', transform=transform,
+                         pre_transform=pre_transform)
+test_dataset = ShapeNet(path, category, split='test',
+                        pre_transform=pre_transform)
+train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True,
+                          num_workers=6)
+test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False,
+                         num_workers=6)
 
 
 class Net(torch.nn.Module):
     def __init__(self, out_channels, k=30, aggr='max'):
-        super(Net, self).__init__()
+        super().__init__()
 
-        self.conv1 = DynamicEdgeConv(MLP([2 * 3, 64, 64]), k, aggr)
+        self.conv1 = DynamicEdgeConv(MLP([2 * 6, 64, 64]), k, aggr)
         self.conv2 = DynamicEdgeConv(MLP([2 * 64, 64, 64]), k, aggr)
         self.conv3 = DynamicEdgeConv(MLP([2 * 64, 64, 64]), k, aggr)
-        self.lin1 = MLP([3 * 64, 1024])
 
-        self.mlp = Seq(
-            MLP([1024, 256]), Dropout(0.5), MLP([256, 128]), Dropout(0.5),
-            Lin(128, out_channels))
+        self.mlp = MLP([3 * 64, 1024, 256, 128, out_channels], dropout=0.5,
+                       norm=None)
 
     def forward(self, data):
-        pos, batch = data.pos, data.batch
-        x1 = self.conv1(pos, batch)
+        x, pos, batch = data.x, data.pos, data.batch
+        x0 = torch.cat([x, pos], dim=-1)
+        x1 = self.conv1(x0, batch)
         x2 = self.conv2(x1, batch)
         x3 = self.conv3(x2, batch)
-        out = self.lin1(torch.cat([x1, x2, x3], dim=1))
-        out = self.mlp(out)
+        out = self.mlp(torch.cat([x1, x2, x3], dim=1))
         return F.log_softmax(out, dim=1)
 
 
@@ -75,52 +68,48 @@ def train():
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-        correct_nodes += out.max(dim=1)[1].eq(data.y).sum().item()
+        correct_nodes += out.argmax(dim=1).eq(data.y).sum().item()
         total_nodes += data.num_nodes
 
         if (i + 1) % 10 == 0:
-            print('[{}/{}] Loss: {:.4f}, Train Accuracy: {:.4f}'.format(
-                i + 1, len(train_loader), total_loss / 10,
-                correct_nodes / total_nodes))
+            print(f'[{i+1}/{len(train_loader)}] Loss: {total_loss / 10:.4f} '
+                  f'Train Acc: {correct_nodes / total_nodes:.4f}')
             total_loss = correct_nodes = total_nodes = 0
 
 
+@torch.no_grad()
 def test(loader):
     model.eval()
 
-    correct_nodes = total_nodes = 0
-    intersections, unions, categories = [], [], []
+    ious, categories = [], []
+    y_map = torch.empty(loader.dataset.num_classes, device=device).long()
     for data in loader:
         data = data.to(device)
-        with torch.no_grad():
-            out = model(data)
-        pred = out.max(dim=1)[1]
-        correct_nodes += pred.eq(data.y).sum().item()
-        total_nodes += data.num_nodes
-        i, u = i_and_u(pred, data.y, test_dataset.num_classes, data.batch)
-        intersections.append(i.to(torch.device('cpu')))
-        unions.append(u.to(torch.device('cpu')))
-        categories.append(data.category.to(torch.device('cpu')))
+        outs = model(data)
 
+        sizes = (data.ptr[1:] - data.ptr[:-1]).tolist()
+        for out, y, category in zip(outs.split(sizes), data.y.split(sizes),
+                                    data.category.tolist()):
+            category = list(ShapeNet.seg_classes.keys())[category]
+            part = ShapeNet.seg_classes[category]
+            part = torch.tensor(part, device=device)
+
+            y_map[part] = torch.arange(part.size(0), device=device)
+
+            iou = jaccard_index(out[:, part].argmax(dim=-1), y_map[y],
+                                num_classes=part.size(0), absent_score=1.0)
+            ious.append(iou)
+
+        categories.append(data.category)
+
+    iou = torch.tensor(ious, device=device)
     category = torch.cat(categories, dim=0)
-    intersection = torch.cat(intersections, dim=0)
-    union = torch.cat(unions, dim=0)
 
-    ious = [[]] * len(loader.dataset.categories)
-    for j in range(len(loader.dataset)):
-        i = intersection[j, loader.dataset.y_mask[category[j]]]
-        u = union[j, loader.dataset.y_mask[category[j]]]
-        iou = i.to(torch.float) / u.to(torch.float)
-        iou[torch.isnan(iou)] = 1
-        ious[category[j]].append(iou.mean().item())
-
-    for cat in range(len(loader.dataset.categories)):
-        ious[cat] = torch.tensor(ious[cat]).mean().item()
-
-    return correct_nodes / total_nodes, torch.tensor(ious).mean().item()
+    mean_iou = scatter(iou, category, reduce='mean')  # Per-category IoU.
+    return float(mean_iou.mean())  # Global IoU.
 
 
 for epoch in range(1, 31):
     train()
-    acc, iou = test(test_loader)
-    print('Epoch: {:02d}, Acc: {:.4f}, IoU: {:.4f}'.format(epoch, acc, iou))
+    iou = test(test_loader)
+    print(f'Epoch: {epoch:02d}, Test IoU: {iou:.4f}')

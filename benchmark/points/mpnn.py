@@ -1,11 +1,15 @@
 import argparse
+
 import torch
 import torch.nn.functional as F
-from torch.nn import Sequential as Seq, Linear as Lin, ReLU
-from torch_geometric.nn import NNConv, radius_graph, fps, global_mean_pool
-
 from points.datasets import get_dataset
 from points.train_eval import run
+from torch.nn import Linear as Lin
+from torch.nn import ReLU
+from torch.nn import Sequential as Seq
+
+from torch_geometric.nn import NNConv, fps, global_mean_pool, radius_graph
+from torch_geometric.profile import rename_profile_file
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--epochs', type=int, default=200)
@@ -14,12 +18,15 @@ parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--lr_decay_factor', type=float, default=0.5)
 parser.add_argument('--lr_decay_step_size', type=int, default=50)
 parser.add_argument('--weight_decay', type=float, default=0)
+parser.add_argument('--inference', action='store_true')
+parser.add_argument('--profile', action='store_true')
+parser.add_argument('--bf16', action='store_true')
 args = parser.parse_args()
 
 
 class Net(torch.nn.Module):
     def __init__(self, num_classes):
-        super(Net, self).__init__()
+        super().__init__()
 
         nn = Seq(Lin(3, 25), ReLU(), Lin(25, 1 * 64))
         self.conv1 = NNConv(1, 64, nn, aggr='mean')
@@ -69,4 +76,8 @@ class Net(torch.nn.Module):
 train_dataset, test_dataset = get_dataset(num_points=1024)
 model = Net(train_dataset.num_classes)
 run(train_dataset, test_dataset, model, args.epochs, args.batch_size, args.lr,
-    args.lr_decay_factor, args.lr_decay_step_size, args.weight_decay)
+    args.lr_decay_factor, args.lr_decay_step_size, args.weight_decay,
+    args.inference, args.profile, args.bf16)
+
+if args.profile:
+    rename_profile_file('points', NNConv.__name__)

@@ -1,0 +1,34 @@
+name: Minimal Installation
+
+on:  # yamllint disable-line rule:truthy
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+
+  import:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup packages
+        uses: ./.github/actions/setup
+
+      - name: Install main package
+        run: |
+          pip install -e .[test]
+
+      - name: Test imports
+        run: |
+          python -c "import torch_geometric"
+          python -c "import torch_geometric.datasets"
+          python -c "import torch_geometric.nn"
+          python -c "import torch_geometric.graphgym"
+
+      - name: Run tests
+        run: |
+          pytest
